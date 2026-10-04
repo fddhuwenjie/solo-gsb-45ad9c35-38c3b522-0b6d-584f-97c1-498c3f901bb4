@@ -429,6 +429,9 @@ def run_checks():
     # -- immutable admission attestations -----------------------------------
     run_admission_attestation_checks()
 
+    # -- admission attestation validity rechecks ----------------------------
+    run_validity_recheck_checks()
+
     # -- WITH exception removes propagation ----------------------------------
     exc_request = {
         "components": [
@@ -4786,6 +4789,419 @@ def run_admission_attestation_checks():
     )
     code, _ = call("GET", "/v1/admission-attestations/att-concurrent-diff")
     check("attestation: exactly one winner persisted", code == 200)
+
+
+def run_validity_recheck_checks():
+    """End-to-end checks for admission attestation validity rechecks.
+
+    Covers: the four stable conclusions (unchanged / valid-changed /
+    pending / expired), per-instance diffs against the proof's snapshot,
+    review_hash stability under reordered and equivalently-spelled
+    inputs, 404 on unknown attestations, 409 on batch id/hash and
+    rule-structure binding drift, whole-request 422s on invalid snapshot
+    inputs, 400 envelope errors, and strict read-only behaviour -- the
+    registered proof, the batch and the attestation table are never
+    touched by a recheck.
+    """
+    rules = {
+        "licenses": {
+            "R-MIT": {"obligations": ["attribution", "license-text"]},
+            "R-GPL": {
+                "obligations": ["attribution", "license-text", "source-offer"],
+                "propagates": ["static"],
+            },
+            "R-ISC": {"obligations": ["attribution"]},
+        },
+        "obligation_scopes": {"source-offer": ["binary", "source"]},
+    }
+    code, _ = call("PUT", "/v1/rulesets/recheck-rules", rules)
+    check("recheck: ruleset published", code == 200)
+
+    def assess(spec):
+        code, out = call("POST", "/v1/assessments",
+                         dict({"ruleset": "recheck-rules"}, **spec))
+        check("recheck: assessment ok (%s)" % spec["product"], code == 200,
+              json.dumps(out)[:160])
+        return out["id"]
+
+    aid1 = assess({
+        "product": "recheck-a", "distribution": "binary",
+        "components": [
+            {"id": "art-x", "name": "Artifact X", "version": "1.0.0",
+             "license": "R-MIT"},
+            {"id": "common", "name": "Common Kit", "version": "2.3.1",
+             "license": "R-GPL", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "art-x", "to": "common"}],
+    })
+    aid2 = assess({
+        "product": "recheck-b", "distribution": "binary",
+        "components": [
+            {"id": "art-y", "name": "Artifact Y", "version": "0.9.0",
+             "license": "R-ISC"},
+            {"id": "common", "name": "Common Kit", "version": "2.3.1",
+             "license": "R-GPL", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "art-y", "to": "common"}],
+    })
+    code, batch = call("POST", "/v1/release-batches", {
+        "batch_id": "recheck-rel-1",
+        "entries": [
+            {"assessment_id": aid1, "id": "art-x", "version": "1.0.0",
+             "dependencies": ["common"]},
+            {"assessment_id": aid2, "id": "art-y", "version": "0.9.0",
+             "dependencies": ["common"]},
+        ],
+    })
+    check("recheck: batch registered", code == 200 and batch.get("created"),
+          json.dumps(batch)[:200])
+    batch_hash = batch["batch_hash"]
+
+    # release Fri 2026-09-25; deadlines: attribution 10-25, license-text
+    # tightened to source-offer 10-06 (5 business days skipping Oct 1/2).
+    def recheck_body(now="2026-10-01T12:00:00+08:00", materials=None):
+        mats = [
+            {"id": "product-notice", "digest": "sha256:aaa",
+             "type": "notice", "scope": "product",
+             "provided_at": "2026-09-26T10:00:00+08:00"},
+            {"id": "common-copy", "digest": "sha256:bbb",
+             "type": "license-copy", "scope": "component",
+             "component": "common",
+             "provided_at": "2026-09-27T10:00:00+08:00"},
+            {"id": "artx-copy", "digest": "sha256:ccc",
+             "type": "license-copy", "scope": "component",
+             "component": "art-x",
+             "provided_at": "2026-09-27T10:00:00+08:00"},
+            {"id": "common-source", "digest": "sha256:ddd",
+             "type": "source-archive", "scope": "component",
+             "component": "common",
+             "provided_at": "2026-09-30T10:00:00+08:00"},
+        ] if materials is None else materials
+        return {
+            "batch_id": "recheck-rel-1",
+            "batch_hash": batch_hash,
+            "now": now,
+            "release_at": "2026-09-25T16:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+            "workdays": [1, 2, 3, 4, 5],
+            "holidays": ["2026-10-01", "2026-10-02"],
+            "obligations": {
+                "attribution": {"offset": 30, "unit": "calendar_day",
+                                "depends_on": []},
+                "license-text": {"offset": 20, "unit": "calendar_day",
+                                 "depends_on": []},
+                "source-offer": {"offset": 5, "unit": "business_day",
+                                 "depends_on": ["license-text"]},
+            },
+            "materials": mats,
+            "rules": {"obligations": {
+                "attribution": {"type": "notice"},
+                "license-text": {"all": [
+                    {"type": "notice"},
+                    {"any": [{"type": "license-copy"},
+                             {"type": "license-bundle"}]},
+                ]},
+                "source-offer": {"all": [
+                    {"type": "source-archive"}, {"scope": "component"},
+                ]},
+            }},
+        }
+
+    mint = dict(recheck_body())
+    mint["attestation_id"] = "recheck-att-1"
+    code, minted = call(
+        "POST", "/v1/release-batches/recheck-rel-1/admission-attestation", mint)
+    check("recheck: attestation minted (all satisfied)",
+          code == 200 and minted.get("created") is True
+          and minted["snapshot"]["summary"]["satisfied"] == 6,
+          json.dumps(minted)[:200])
+    att_hash = minted["attestation_hash"]
+    snap_hash = minted["snapshot_hash"]
+    path = "/v1/admission-attestations/recheck-att-1/validity-recheck"
+
+    def attestation_rows():
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM release_batch_attestations"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    rows_before = attestation_rows()
+
+    # -- unchanged: identical inputs reproduce the proof's snapshot ---------
+    code, out = call("POST", path, recheck_body())
+    check("recheck: identical inputs -> unchanged",
+          code == 200 and out.get("conclusion") == "unchanged"
+          and out.get("changed_instances") == []
+          and out.get("changed_count") == 0
+          and out.get("snapshot_hash") == snap_hash
+          and out.get("attestation_snapshot_hash") == snap_hash
+          and out.get("attestation_hash") == att_hash
+          and out.get("batch_id") == "recheck-rel-1"
+          and out.get("batch_hash") == batch_hash
+          and out.get("attestation_now") == "2026-10-01T04:00:00Z"
+          and out.get("now") == "2026-10-01T04:00:00Z"
+          and out.get("summary") == {"total": 6, "satisfied": 6,
+                                     "overdue": 0, "pending": 0}
+          and out.get("attestation_summary") == out.get("summary")
+          and len(out.get("review_hash", "")) == 64
+          and out.get("snapshot", {}).get("snapshot_hash") == snap_hash,
+          json.dumps(out)[:300])
+    review_hash = out["review_hash"]
+
+    code, out2 = call("POST", path, recheck_body())
+    check("recheck: repeated review is byte-stable",
+          code == 200 and out2.get("review_hash") == review_hash)
+
+    # equivalent instant spellings + reordered arrays/keys -> same review
+    eq = recheck_body()
+    eq["now"] = "2026-10-01T04:00:00Z"
+    eq["release_at"] = "2026-09-25T08:00:00Z"
+    eq["materials"] = list(reversed(eq["materials"]))
+    eq["workdays"] = [5, 4, 3, 2, 1]
+    eq["holidays"] = ["2026-10-02", "2026-10-01"]
+    eq["obligations"] = {
+        "source-offer": {"depends_on": ["license-text"],
+                         "unit": "business_day", "offset": 5},
+        "attribution": {"depends_on": [], "unit": "calendar_day",
+                        "offset": 30},
+        "license-text": {"depends_on": [], "unit": "calendar_day",
+                         "offset": 20},
+    }
+    code, eqout = call("POST", path, eq)
+    check("recheck: equivalent spellings/order -> same review hash",
+          code == 200 and eqout.get("conclusion") == "unchanged"
+          and eqout.get("review_hash") == review_hash,
+          json.dumps(eqout)[:200])
+
+    # -- valid-changed: later now, everything still satisfied ---------------
+    code, vc = call("POST", path,
+                    recheck_body(now="2026-10-03T09:00:00+08:00"))
+    check("recheck: later now still satisfied -> valid-changed",
+          code == 200 and vc.get("conclusion") == "valid-changed"
+          and vc.get("changed_instances") == []
+          and vc.get("changed_count") == 0
+          and vc.get("snapshot_hash") != snap_hash
+          and vc.get("summary", {}).get("satisfied") == 6
+          and vc.get("review_hash") != review_hash,
+          json.dumps(vc)[:200])
+
+    # the embedded snapshot matches the stateless snapshot endpoint exactly
+    code, snap = call(
+        "POST", "/v1/release-batches/recheck-rel-1/fulfillment-snapshot",
+        recheck_body(now="2026-10-03T09:00:00+08:00"))
+    check("recheck: embedded snapshot equals stateless snapshot",
+          code == 200 and snap.get("snapshot_hash") == vc.get("snapshot_hash")
+          and vc.get("snapshot") == snap)
+
+    # valid-changed via material substitution: satisfied_by changes
+    mats = [m for m in recheck_body()["materials"]
+            if m["id"] != "common-copy"]
+    mats.append({"id": "common-copy-v2", "digest": "sha256:b2",
+                 "type": "license-copy", "scope": "component",
+                 "component": "common",
+                 "provided_at": "2026-09-28T10:00:00+08:00"})
+    code, vc2 = call("POST", path, recheck_body(materials=mats))
+    changed = {(i["component"], i["obligation"]): i
+               for i in vc2.get("changed_instances", [])}
+    lt = changed.get(("common", "license-text"), {})
+    so = changed.get(("common", "source-offer"), {})
+    check("recheck: substituted material -> valid-changed with diff",
+          code == 200 and vc2.get("conclusion") == "valid-changed"
+          and vc2.get("changed_count") == 2
+          and lt.get("old_status") == "satisfied"
+          and lt.get("new_status") == "satisfied"
+          and lt.get("old_satisfied_by") == ["common-copy",
+                                             "product-notice"]
+          and lt.get("new_satisfied_by") == ["common-copy-v2",
+                                             "product-notice"]
+          and lt.get("deadline") == "2026-10-06"
+          and so.get("old_satisfied_by") == ["common-copy",
+                                             "common-source"]
+          and so.get("new_satisfied_by") == ["common-copy-v2",
+                                             "common-source"],
+          json.dumps(vc2.get("changed_instances"))[:300])
+
+    # -- pending: source evidence retracted, deadline still open ------------
+    mats = [m for m in recheck_body()["materials"]
+            if m["id"] != "common-source"]
+    code, pe = call("POST", path, recheck_body(materials=mats))
+    changed = {(i["component"], i["obligation"]): i
+               for i in pe.get("changed_instances", [])}
+    inst = changed.get(("common", "source-offer"), {})
+    check("recheck: retracted source material -> pending",
+          code == 200 and pe.get("conclusion") == "pending"
+          and pe.get("summary") == {"total": 6, "satisfied": 5,
+                                    "overdue": 0, "pending": 1}
+          and pe.get("changed_count") == 1
+          and inst.get("old_status") == "satisfied"
+          and inst.get("new_status") == "pending"
+          and inst.get("old_satisfied_by") == ["common-copy",
+                                               "common-source"]
+          and inst.get("new_satisfied_by") == []
+          and inst.get("deadline") == "2026-10-06"
+          and inst.get("gaps", [{}])[0].get("reason")
+          == "incomplete-evidence"
+          and inst.get("gaps", [{}])[0].get("missing_leaves")
+          == [{"type": "source-archive"}]
+          and inst.get("gaps", [{}])[0].get("candidate_materials")
+          == ["common-copy"],
+          json.dumps(pe.get("changed_instances"))[:300])
+
+    # -- expired: same retraction, now past the tightened 10-06 deadline ----
+    code, ex = call("POST", path, recheck_body(
+        now="2026-10-10T12:00:00+08:00", materials=mats))
+    check("recheck: past deadline -> expired",
+          code == 200 and ex.get("conclusion") == "expired"
+          and ex.get("summary") == {"total": 6, "satisfied": 5,
+                                    "overdue": 1, "pending": 0}
+          and ex.get("changed_instances", [{}])[0].get("new_status")
+          == "overdue",
+          json.dumps(ex.get("summary")))
+
+    # expired with every material retracted
+    code, ex2 = call("POST", path, recheck_body(
+        now="2026-10-10T12:00:00+08:00", materials=[]))
+    check("recheck: no materials past deadlines -> expired summary",
+          code == 200 and ex2.get("conclusion") == "expired"
+          and ex2.get("summary") == {"total": 6, "satisfied": 0,
+                                     "overdue": 3, "pending": 3}
+          and ex2.get("changed_count") == 6
+          and ex2.get("attestation_summary") == {
+              "total": 6, "satisfied": 6, "overdue": 0, "pending": 0},
+          json.dumps(ex2.get("summary")))
+
+    # -- 404 / 409 bindings ---------------------------------------------------
+    code, _ = call(
+        "POST", "/v1/admission-attestations/ghost-recheck/validity-recheck",
+        recheck_body())
+    check("recheck: unknown attestation -> 404", code == 404)
+
+    bad = recheck_body()
+    bad["batch_id"] = "recheck-rel-2"
+    code, bo = call("POST", path, bad)
+    check("recheck: batch id mismatch -> 409",
+          code == 409 and bo.get("reason") == "batch-id-mismatch"
+          and bo.get("expected_batch_id") == "recheck-rel-2"
+          and bo.get("registered_batch_id") == "recheck-rel-1",
+          json.dumps(bo)[:200])
+
+    bad = recheck_body()
+    bad["batch_hash"] = "f" * 64
+    code, bo = call("POST", path, bad)
+    check("recheck: batch hash mismatch -> 409",
+          code == 409 and bo.get("reason") == "batch-hash-mismatch"
+          and bo.get("expected_batch_hash") == "f" * 64
+          and bo.get("registered_batch_hash") == batch_hash,
+          json.dumps(bo)[:200])
+
+    # -- 409 rule-structure drift (only now/materials may change) ------------
+    def drifted(fn):
+        b = json.loads(json.dumps(recheck_body()))
+        fn(b)
+        return b
+
+    drifts = [
+        ("release_at", drifted(lambda b: b.update(
+            release_at="2026-09-26T16:00:00+08:00")), "release_at"),
+        ("timezone", drifted(lambda b: b.update(timezone="UTC")), "timezone"),
+        ("workdays", drifted(lambda b: b.update(
+            workdays=[1, 2, 3, 4, 5, 6])), "workdays"),
+        ("holidays", drifted(lambda b: b.update(
+            holidays=["2026-10-01"])), "holidays"),
+        ("obligations offset", drifted(lambda b: b["obligations"]
+         ["attribution"].update(offset=31)), "obligations"),
+        ("obligations depends_on", drifted(lambda b: b["obligations"]
+         ["source-offer"].update(depends_on=[])), "obligations"),
+        ("evidence rules", drifted(lambda b: b["rules"]["obligations"]
+         .update(attribution={"type": "x-notice"})), "rules"),
+        ("evidence rules dropped", drifted(lambda b: b.pop("rules")),
+         "rules"),
+    ]
+    for label, body, field in drifts:
+        code, bo = call("POST", path, body)
+        check("recheck: drifted %s -> 409 binding mismatch" % label,
+              code == 409
+              and bo.get("reason") == "attestation-binding-mismatch"
+              and bo.get("fields") == [field]
+              and bo.get("attestation_id") == "recheck-att-1",
+              "%s -> %s %s" % (label, code, json.dumps(bo)[:160]))
+
+    # -- 422 invalid snapshot inputs (whole request, no review) --------------
+    bad_inputs = [
+        ("unknown timezone", drifted(lambda b: b.update(
+            timezone="Mars/Olympus"))),
+        ("bad now", drifted(lambda b: b.update(now="2026-10-03 12:00"))),
+        ("null now", drifted(lambda b: b.update(now=None))),
+        ("bad release_at", drifted(lambda b: b.update(
+            release_at="2026-09-25T16:00:00"))),
+        ("missing obligation rule", drifted(
+            lambda b: b["obligations"].pop("attribution"))),
+        ("dangling depends_on", drifted(lambda b: b["obligations"]
+         ["attribution"].update(depends_on=["ghost"]))),
+        ("dependency cycle", drifted(lambda b: b["obligations"]
+         ["license-text"].update(depends_on=["source-offer"]))),
+        ("bad provided_at", drifted(lambda b: b["materials"][0].update(
+            provided_at="yesterday"))),
+        ("duplicate material id", drifted(
+            lambda b: b["materials"].append(dict(b["materials"][0])))),
+        ("material unknown component", drifted(lambda b: b["materials"]
+         .append({"id": "x", "type": "notice", "scope": "component",
+                  "component": "ghost",
+                  "provided_at": "2026-09-26T10:00:00Z"}))),
+        ("rule all+any", drifted(lambda b: b["rules"]["obligations"]
+         ["attribution"].update(
+             {"all": [{"type": "notice"}], "any": [{"type": "x"}]}))),
+    ]
+    for label, bad in bad_inputs:
+        code, bo = call("POST", path, bad)
+        check("recheck: 422 on %s" % label,
+              code == 422 and "review_hash" not in bo,
+              "%s -> %s %s" % (label, code, json.dumps(bo)[:120]))
+
+    # -- 400 envelope errors ---------------------------------------------------
+    bad_envelopes = [
+        ["not-an-object"],
+        {"batch_id": "recheck-rel-1", "batch_hash": batch_hash},
+        {"batch_hash": batch_hash, "now": "2026-10-01T12:00:00+08:00"},
+        {"batch_id": "", "batch_hash": batch_hash},
+        {"batch_id": "bad id!", "batch_hash": batch_hash},
+        {"batch_id": "recheck-rel-1", "batch_hash": "deadbeef"},
+        {"batch_id": "recheck-rel-1", "batch_hash": 12345},
+        {k: v for k, v in recheck_body().items() if k != "obligations"},
+        {k: v for k, v in recheck_body().items() if k != "holidays"},
+        {k: v for k, v in recheck_body().items() if k != "release_at"},
+    ]
+    for i, bad in enumerate(bad_envelopes):
+        code, bo = call("POST", path, bad)
+        check("recheck: envelope error %d -> 400" % i,
+              code == 400 and "review_hash" not in bo,
+              "%s" % json.dumps(bo)[:100])
+
+    # -- strictly read-only: proof, batch and table are untouched ------------
+    code, frozen = call("GET", "/v1/admission-attestations/recheck-att-1")
+    check("recheck: proof unchanged after rechecks",
+          code == 200 and frozen.get("attestation_hash") == att_hash
+          and frozen.get("snapshot_hash") == snap_hash
+          and frozen.get("snapshot", {}).get("summary", {})
+          .get("satisfied") == 6)
+    code, fb = call("GET", "/v1/release-batches/recheck-rel-1")
+    check("recheck: batch manifest unchanged after rechecks",
+          code == 200 and fb.get("batch_hash") == batch_hash)
+    check("recheck: no attestation rows written by rechecks",
+          attestation_rows() == rows_before)
+
+    # a fresh mint with the same content still folds onto the same proof
+    mint2 = dict(recheck_body())
+    mint2["attestation_id"] = "recheck-att-1"
+    code, folded = call(
+        "POST", "/v1/release-batches/recheck-rel-1/admission-attestation",
+        mint2)
+    check("recheck: original attestation still idempotent afterwards",
+          code == 200 and folded.get("created") is False
+          and folded.get("attestation_hash") == att_hash)
 
 
 def run_accounting_snapshot_checks():

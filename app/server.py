@@ -24,6 +24,7 @@ Endpoints:
     POST /v1/release-batches/{batch_id}/fulfillment-snapshot
     POST /v1/release-batches/{batch_id}/admission-attestation
     GET  /v1/admission-attestations/{attestation_id}
+    POST /v1/admission-attestations/{attestation_id}/validity-recheck
 """
 
 import json
@@ -38,6 +39,7 @@ from .batches import validate_batch_body
 from .common import ClientError, ConflictError, NotFound, stable_hash
 from .compare import compare_assessments
 from .fulfillment import UnprocessableError, check_fulfillment
+from .recheck import validate_recheck_body
 from .remediation import RemediationConflict, plan_remediation
 from .responsibility import PartialPlanError, build_plan
 from .revisions import REVISION_ID_LEN
@@ -63,7 +65,8 @@ _BATCH_RE = re.compile(
     r"(/(?:fulfillment-snapshot|admission-attestation))?)?$"
 )
 _ATTEST_RE = re.compile(
-    r"^/v1/admission-attestations(?:/([A-Za-z0-9._-]{1,128}))?$"
+    r"^/v1/admission-attestations(?:/([A-Za-z0-9._-]{1,128})"
+    r"(/(?:validity-recheck))?)?$"
 )
 
 
@@ -374,6 +377,17 @@ class Api:
             )
         return out
 
+    def recheck_admission_attestation(self, attestation_id, body):
+        # The envelope (batch binding + required snapshot fields) is
+        # validated here; the store then loads the immutable proof and
+        # its frozen batch in one read-only transaction, enforces the
+        # binding invariants (409) and recomputes the snapshot (422 on
+        # invalid content) -- never rewriting the registered proof.
+        batch_id, expected_hash, snapshot_body = validate_recheck_body(body)
+        return self.store.recheck_admission_attestation(
+            attestation_id, batch_id, expected_hash, snapshot_body
+        )
+
 
 def make_server(host, port, store):
     api = Api(store)
@@ -455,6 +469,7 @@ def make_server(host, port, store):
                                 "POST /v1/release-batches/{batch_id}/fulfillment-snapshot",
                                 "POST /v1/release-batches/{batch_id}/admission-attestation",
                                 "GET  /v1/admission-attestations/{attestation_id}",
+                                "POST /v1/admission-attestations/{attestation_id}/validity-recheck",
                             ],
                         },
                     )
@@ -485,9 +500,18 @@ def make_server(host, port, store):
                     )
 
                 m = _ATTEST_RE.match(path)
-                if m and method == "GET" and m.group(1) is not None:
+                if m and method == "GET" and m.group(1) is not None \
+                        and m.group(2) is None:
                     return self._json(
                         200, api.get_admission_attestation(m.group(1))
+                    )
+                if m and method == "POST" and m.group(1) is not None \
+                        and m.group(2) == "/validity-recheck":
+                    return self._json(
+                        200,
+                        api.recheck_admission_attestation(
+                            m.group(1), self._body()
+                        ),
                     )
 
                 m = _REVISION_RE.match(path)

@@ -11,6 +11,7 @@ from .attestation import build_admission_attestation
 from .batches import assemble_manifest, canonical_entries
 from .common import ConflictError, NotFound, stable_hash
 from .fulfillment import UnprocessableError
+from .recheck import build_validity_recheck
 from .revisions import revision_id
 from .solver import assess_normalized
 
@@ -1378,3 +1379,54 @@ class Store:
         out = json.loads(row["body"])
         out.pop("created", None)
         return out
+
+    def recheck_admission_attestation(
+        self, attestation_id, batch_id, expected_hash, body
+    ):
+        """Re-verify a registered attestation inside one read transaction.
+
+        The immutable proof and its frozen batch manifest are loaded in a
+        single deferred read transaction (one consistent WAL snapshot for
+        every SELECT), the fulfillment snapshot is recomputed there for
+        the submitted -- new -- inputs, and a stable validity conclusion
+        is returned.  The method never writes: the registered proof and
+        the batch manifest remain byte-identical, and no review rows are
+        persisted.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            row = conn.execute(
+                "SELECT batch_id, body, request_hash FROM"
+                " release_batch_attestations WHERE attestation_id = ?",
+                (attestation_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFound(
+                    "admission attestation %r not found" % attestation_id
+                )
+            attestation = json.loads(row["body"])
+            mrow = conn.execute(
+                "SELECT manifest FROM release_batches WHERE batch_id = ?",
+                (row["batch_id"],),
+            ).fetchone()
+            if mrow is None:
+                # Unreachable while batches stay immutable and the FK is
+                # enforced; surfaced as 404 rather than rechecking a
+                # dangling proof.
+                raise NotFound(
+                    "release batch %r not found" % row["batch_id"]
+                )
+            manifest = json.loads(mrow["manifest"])
+            return build_validity_recheck(
+                attestation,
+                row["request_hash"],
+                manifest,
+                attestation_id,
+                batch_id,
+                expected_hash,
+                body,
+            )
+        finally:
+            conn.rollback()
+            conn.close()
