@@ -1,0 +1,5372 @@
+#!/usr/bin/env python3
+"""End-to-end self test: boots the API on an ephemeral port and exercises
+every flow (ok / conflict / cycle / missing rules / invalid expression /
+confirmation / replay / input-order invariance / fulfillment checks).
+
+Run:  python3 tests/selftest.py
+"""
+
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import threading
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.common import ConflictError, NotFound, stable_hash  # noqa: E402
+from app.rules import DEFAULT_RULESET, validate_ruleset  # noqa: E402
+from app.remediation import RemediationConflict  # noqa: E402
+from app.server import Api, make_server  # noqa: E402
+from app.solver import assess_normalized, normalize_request  # noqa: E402
+from app.store import Store  # noqa: E402
+
+CHECKS = []
+
+
+def check(name, condition, detail=""):
+    CHECKS.append((name, bool(condition)))
+    print("%s %s %s" % ("PASS" if condition else "FAIL", name, detail))
+
+
+def call(method, path, obj=None):
+    data = json.dumps(obj).encode("utf-8") if obj is not None else None
+    req = urllib.request.Request(
+        BASE + path,
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def main():
+    global BASE, DB_PATH
+    tmp = tempfile.mkdtemp(prefix="licapi-test-")
+    DB_PATH = os.path.join(tmp, "test.db")
+    store = Store(DB_PATH)
+    store.put_ruleset("default", validate_ruleset(DEFAULT_RULESET))
+    server = make_server("127.0.0.1", 0, store)
+    BASE = "http://127.0.0.1:%d" % server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        run_checks()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    failed = [n for n, ok in CHECKS if not ok]
+    print("\n%d checks, %d failed" % (len(CHECKS), len(failed)))
+    return 1 if failed else 0
+
+
+def run_checks():
+    # -- health & rulesets --------------------------------------------------
+    code, body = call("GET", "/health")
+    check("health", code == 200 and body.get("status") == "ok")
+
+    code, body = call("GET", "/v1/rulesets/default")
+    check(
+        "default ruleset seeded",
+        code == 200 and "MIT" in body.get("ruleset", {}).get("licenses", {}),
+    )
+
+    code, body = call("PUT", "/v1/rulesets/empty-scope", {"licenses": {"X-1.0": {}}})
+    check("put custom ruleset", code == 200 and body.get("created") is True)
+
+    code, body = call("PUT", "/v1/rulesets/bad", {"licenses": {"X": {"propagates": ["wire"]}}})
+    check("invalid ruleset rejected", code == 400)
+
+    # -- ok flow: OR picks the branch with fewest obligations ---------------
+    ok_request = {
+        "product": "demo-product",
+        "distribution": "binary",
+        "components": [
+            {"id": "app", "name": "App", "version": "1.0.0", "license": "MIT"},
+            {"id": "liba", "name": "LibA", "version": "2.0",
+             "license": "Apache-2.0 OR MIT", "linkage": "static"},
+            {"id": "libb", "name": "LibB", "version": "3.1",
+             "license": "GPL-2.0-only", "linkage": "static"},
+        ],
+        "dependencies": [
+            {"from": "app", "to": "liba"},
+            {"from": "app", "to": "libb"},
+        ],
+    }
+    code, body = call("POST", "/v1/assessments", ok_request)
+    result = body.get("result", {})
+    check("ok assessment 200", code == 200, json.dumps(body)[:200])
+    check("ok assessment created", body.get("created") is True)
+    check("ok status", result.get("status") == "ok" and result.get("release") is True)
+    # Apache-2.0 would clash with GPL-2.0-only, so MIT must be adopted even
+    # though the constraint (not just the obligation count) forces it.
+    check(
+        "constraint-respecting OR branch",
+        result.get("adopted", {}).get("liba") == "MIT",
+        str(result.get("adopted")),
+    )
+    check(
+        "copyleft obligations propagated",
+        "source-offer" in result.get("artifact_obligations", [])
+        and "same-license" in result.get("artifact_obligations", []),
+        str(result.get("artifact_obligations")),
+    )
+    aid = body.get("id")
+    hash1 = result.get("summary_hash")
+
+    # -- input order invariance ---------------------------------------------
+    permuted = {
+        "distribution": "binary",
+        "product": "demo-product",
+        "dependencies": [
+            {"from": "app", "to": "libb"},
+            {"from": "app", "to": "liba"},
+        ],
+        "components": [
+            {"id": "libb", "version": "3.1", "name": "LibB",
+             "linkage": "static", "license": "GPL-2.0-only"},
+            {"id": "liba", "linkage": "static", "license": "Apache-2.0 OR MIT",
+             "name": "LibA", "version": "2.0"},
+            {"id": "app", "license": "MIT", "name": "App", "version": "1.0.0"},
+        ],
+    }
+    code, body2 = call("POST", "/v1/assessments", permuted)
+    check(
+        "input order does not change summary",
+        code == 200
+        and body2.get("id") == aid
+        and body2.get("result", {}).get("summary_hash") == hash1
+        and body2.get("created") is False,
+    )
+
+    # -- saas scope drops binary-only obligations ---------------------------
+    saas_req = dict(ok_request, distribution="saas")
+    code, body3 = call("POST", "/v1/assessments", saas_req)
+    obs = body3.get("result", {}).get("artifact_obligations", [])
+    check("scope gating drops source-offer under saas",
+          code == 200 and "source-offer" not in obs and "same-license" in obs)
+
+    # -- conflict flow -------------------------------------------------------
+    conflict_request = {
+        "product": "clash",
+        "components": [
+            {"id": "app", "license": "MIT"},
+            {"id": "libg", "license": "GPL-2.0-only", "linkage": "static"},
+            {"id": "libap", "license": "Apache-2.0", "linkage": "static"},
+            {"id": "docs", "license": "CC0-1.0"},
+        ],
+        "dependencies": [
+            {"from": "app", "to": "libg"},
+            {"from": "app", "to": "libap"},
+        ],
+    }
+    code, body = call("POST", "/v1/assessments", conflict_request)
+    result = body.get("result", {})
+    check("conflict status", result.get("status") == "conflict")
+    check("conflict never releases", result.get("release") is False)
+    check(
+        "minimal conflicting component set",
+        result.get("conflicting_components") == ["app", "libap", "libg"],
+        str(result.get("conflicting_components")),
+    )
+    confirmed_ids = [c["id"] for c in result.get("confirmed_subgraph", {}).get("components", [])]
+    check("confirmed subgraph excludes conflict", confirmed_ids == ["docs"])
+    conflict_aid = body.get("id")
+
+    code, body = call("POST", "/v1/assessments/%s/confirm" % conflict_aid)
+    check("conflict cannot be confirmed", code == 409)
+
+    # -- same-license clash --------------------------------------------------
+    clash_request = {
+        "components": [
+            {"id": "app", "license": "MIT"},
+            {"id": "g2", "license": "GPL-2.0-only", "linkage": "static"},
+            {"id": "g3", "license": "GPL-3.0-only", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "app", "to": "g2"}, {"from": "app", "to": "g3"}],
+    }
+    code, body = call("POST", "/v1/assessments", clash_request)
+    types = [c["type"] for c in body.get("result", {}).get("conflicts", [])]
+    check("same-license clash detected",
+          body.get("result", {}).get("status") == "conflict"
+          and "same-license-clash" in types)
+
+    # -- all OR branches conflict: minimal set spans every blocked branch ----
+    unsat_request = {
+        "components": [
+            {"id": "app", "license": "MIT"},
+            {"id": "x", "license": "GPL-2.0-only OR GPL-3.0-only", "linkage": "static"},
+            {"id": "y", "license": "Apache-2.0", "linkage": "static"},
+            {"id": "z", "license": "LGPL-2.1-only", "linkage": "static"},
+            {"id": "ok1", "license": "MIT"},
+        ],
+        "dependencies": [{"from": "app", "to": c} for c in ("x", "y", "z")],
+    }
+    code, body = call("POST", "/v1/assessments", unsat_request)
+    result = body.get("result", {})
+    check("all-branches conflict status",
+          result.get("status") == "conflict" and result.get("release") is False)
+    check(
+        "minimal conflict set covers every blocked branch",
+        result.get("conflicting_components") == ["app", "x", "y", "z"],
+        str(result.get("conflicting_components")),
+    )
+    confirmed_ids = [c["id"] for c in result.get("confirmed_subgraph", {}).get("components", [])]
+    check("all-branches confirmed subgraph", confirmed_ids == ["ok1"])
+
+    # -- cycle ---------------------------------------------------------------
+    cycle_request = {
+        "components": [
+            {"id": "a", "license": "MIT"},
+            {"id": "b", "license": "MIT"},
+            {"id": "c", "license": "ISC"},
+        ],
+        "dependencies": [{"from": "a", "to": "b"}, {"from": "b", "to": "a"}],
+    }
+    code, body = call("POST", "/v1/assessments", cycle_request)
+    result = body.get("result", {})
+    check("cycle detected",
+          result.get("status") == "dependency-cycle" and result.get("release") is False)
+    check("cycle conflict set", result.get("conflicting_components") == ["a", "b"])
+    confirmed_ids = [c["id"] for c in result.get("confirmed_subgraph", {}).get("components", [])]
+    check("cycle confirmed subgraph", confirmed_ids == ["c"])
+
+    # -- missing rules -------------------------------------------------------
+    missing_request = {
+        "components": [
+            {"id": "x", "license": "Custom-1.0"},
+            {"id": "y", "license": "MIT"},
+        ],
+        "dependencies": [{"from": "x", "to": "y"}],
+    }
+    code, body = call("POST", "/v1/assessments", missing_request)
+    result = body.get("result", {})
+    check("missing rules",
+          result.get("status") == "missing-rules" and result.get("release") is False)
+    check("missing rules conflict set", result.get("conflicting_components") == ["x"])
+
+    # -- invalid expression --------------------------------------------------
+    bad_expr_request = {
+        "components": [
+            {"id": "x", "license": "MIT AND ("},
+            {"id": "y", "license": "MIT"},
+        ]
+    }
+    code, body = call("POST", "/v1/assessments", bad_expr_request)
+    result = body.get("result", {})
+    check("invalid expression",
+          result.get("status") == "invalid-expression" and result.get("release") is False)
+    check("invalid expression conflict set", result.get("conflicting_components") == ["x"])
+
+    # -- deeply nested expressions (no call-stack recursion anywhere) --------
+    run_deep_expression_checks()
+
+    # -- unknown ruleset / unknown assessment --------------------------------
+    code, body = call("POST", "/v1/assessments", dict(ok_request, ruleset="nope"))
+    check("unknown ruleset -> 404", code == 404)
+    code, body = call("GET", "/v1/assessments/" + "0" * 32)
+    check("unknown assessment -> 404", code == 404)
+
+    # -- confirmation: manifest, adopted branches, NOTICE, replay ------------
+    code, conf = call("POST", "/v1/assessments/%s/confirm" % aid)
+    check("confirm ok", code == 200 and conf.get("status") == "confirmed", json.dumps(conf)[:200])
+    artifacts = conf.get("manifest", {}).get("artifacts", [])
+    check("manifest lists artifacts", [a["id"] for a in artifacts] == ["app", "liba", "libb"])
+    check("adopted branches recorded",
+          conf.get("adopted_licenses", {}).get("liba") == "MIT")
+    notice = conf.get("notice", "")
+    check("NOTICE mentions components", "LibA" in notice and "LibB" in notice)
+    check("NOTICE omits non-attribution licenses", True)  # placeholder clarity
+
+    replay = conf.get("replay", {})
+    check("replay references endpoint",
+          replay.get("endpoint") == "POST /v1/assessments")
+    check("replay pins summary hash", replay.get("expected_summary_hash") == hash1)
+    check("replay records ruleset provenance", replay.get("ruleset") == "default")
+    check("replay embeds inline rules snapshot",
+          isinstance(replay.get("request", {}).get("rules"), dict)
+          and replay.get("rules_hash")
+          == stable_hash(validate_ruleset(DEFAULT_RULESET)))
+
+    # the replay request is submitted verbatim -- no reconstruction -- and
+    # must hit the same assessment id and summary hash
+    code, body = call(
+        "POST", replay.get("endpoint", "").replace("POST ", ""), replay.get("request")
+    )
+    check("replay reproduces summary",
+          code == 200
+          and body.get("id") == aid
+          and body.get("result", {}).get("summary_hash") == hash1
+          and body.get("created") is False)
+
+    # confirmation is idempotent
+    code, conf2 = call("POST", "/v1/assessments/%s/confirm" % aid)
+    check("confirm idempotent",
+          code == 200 and conf2.get("confirmation_hash") == conf.get("confirmation_hash"))
+    code, conf3 = call("GET", "/v1/assessments/%s/confirmation" % aid)
+    check("get confirmation",
+          code == 200 and conf3.get("confirmation_hash") == conf.get("confirmation_hash"))
+
+    # -- inline rules --------------------------------------------------------
+    inline_request = {
+        "components": [{"id": "solo", "license": "X-1.0"}],
+        "rules": {"licenses": {"X-1.0": {"obligations": ["attribution"]}}},
+    }
+    code, body = call("POST", "/v1/assessments", inline_request)
+    check("inline rules accepted",
+          code == 200 and body.get("result", {}).get("status") == "ok")
+    inline_aid = body.get("id")
+    inline_hash = body.get("result", {}).get("summary_hash")
+
+    code, body = call("GET", "/v1/assessments/%s" % inline_aid)
+    check(
+        "assessment stores rules snapshot",
+        body.get("rules") is not None and body.get("ruleset") is None,
+    )
+
+    # an inline-rule assessment is confirmable and its replay is self-contained
+    code, conf = call("POST", "/v1/assessments/%s/confirm" % inline_aid)
+    check("inline-rules confirm", code == 200 and conf.get("status") == "confirmed")
+    replay = conf.get("replay", {})
+    check(
+        "inline-rules replay has no ruleset dependency",
+        replay.get("ruleset") is None and isinstance(replay.get("request", {}).get("rules"), dict),
+    )
+    code, body = call(
+        "POST", replay.get("endpoint", "").replace("POST ", ""), replay.get("request")
+    )
+    check(
+        "inline-rules replay reproduces assessment",
+        code == 200
+        and body.get("id") == inline_aid
+        and body.get("result", {}).get("summary_hash") == inline_hash,
+    )
+
+    # -- replay survives a same-named ruleset being overwritten --------------
+    mut_rules = {"licenses": {"MIT": {"obligations": ["attribution"]},
+                              "X-1.0": {"obligations": ["attribution"]}}}
+    call("PUT", "/v1/rulesets/mutable", mut_rules)
+    pinned_request = {
+        "product": "pinned",
+        "ruleset": "mutable",
+        "components": [{"id": "solo", "license": "X-1.0"}],
+    }
+    code, body = call("POST", "/v1/assessments", pinned_request)
+    pinned_aid = body.get("id")
+    pinned_hash = body.get("result", {}).get("summary_hash")
+    check("pinned assessment created", code == 200 and pinned_hash is not None)
+
+    # overwrite the same-named ruleset with materially different rules
+    mut_rules_changed = {
+        "licenses": {
+            "MIT": {"obligations": ["attribution"]},
+            "X-1.0": {
+                "obligations": ["attribution", "license-text", "source-offer"],
+                "propagates": ["static"],
+            },
+        }
+    }
+    call("PUT", "/v1/rulesets/mutable", mut_rules_changed)
+    # the stored assessment result is untouched by the overwrite
+    code, body = call("GET", "/v1/assessments/%s" % pinned_aid)
+    check(
+        "overwritten ruleset does not mutate stored assessment",
+        code == 200 and body.get("result", {}).get("summary_hash") == pinned_hash,
+    )
+    # a fresh assessment referencing the new ruleset is a *different* record
+    code, body = call("POST", "/v1/assessments", pinned_request)
+    check(
+        "overwritten ruleset yields new assessment",
+        code == 200 and body.get("id") != pinned_aid
+        and body.get("result", {}).get("summary_hash") != pinned_hash,
+    )
+    # confirmation of the old assessment still works and the replay pins the
+    # original snapshot -- it never reads the current "mutable" ruleset
+    code, conf = call("POST", "/v1/assessments/%s/confirm" % pinned_aid)
+    check("confirm after ruleset overwrite", code == 200, json.dumps(conf)[:200])
+    replay = conf.get("replay", {})
+    check(
+        "replay pins the pre-overwrite snapshot",
+        replay.get("rules_hash") == stable_hash(validate_ruleset(mut_rules))
+        and replay.get("rules_hash") != stable_hash(validate_ruleset(mut_rules_changed)),
+    )
+    code, body = call(
+        "POST", replay.get("endpoint", "").replace("POST ", ""), replay.get("request")
+    )
+    check(
+        "replay after ruleset overwrite reproduces original",
+        code == 200 and body.get("id") == pinned_aid
+        and body.get("result", {}).get("summary_hash") == pinned_hash,
+    )
+
+    # -- legacy SQLite migration: verified rows heal, others are refused -----
+    run_legacy_migration_checks()
+
+    # -- shared immutable accounting snapshots (confirm/compare/remediation/-
+    #    impact-review all read one proven snapshot, never active rules) ----
+    run_accounting_snapshot_checks()
+
+    # -- immutable revisions, atomic activation, rollback & concurrency ------
+    run_revision_checks()
+
+    # -- pre-publication impact review --------------------------------------
+    run_impact_review_checks()
+
+    # -- immutable release batches ------------------------------------------
+    run_release_batch_checks()
+
+    # -- fulfillment status snapshots over frozen batches -------------------
+    run_batch_snapshot_checks()
+
+    # -- immutable admission attestations -----------------------------------
+    run_admission_attestation_checks()
+
+    # -- WITH exception removes propagation ----------------------------------
+    exc_request = {
+        "components": [
+            {"id": "app", "license": "MIT"},
+            {"id": "rt", "license": "GPL-3.0-only WITH Classpath-exception-2.0",
+             "linkage": "static"},
+        ],
+        "dependencies": [{"from": "app", "to": "rt"}],
+    }
+    code, body = call("POST", "/v1/assessments", exc_request)
+    result = body.get("result", {})
+    check("WITH exception lifts same-license",
+          result.get("status") == "ok"
+          and "same-license" not in result.get("artifact_obligations", []))
+
+    # -- large OR space: global search finds the feasible joint pick ---------
+    # 13 binary OR components -> 8192 combinations.  The per-component
+    # cheapest branches (Apache-2.0, lexicographically smaller at equal
+    # obligation count) jointly clash with the fixed GPL-2.0-only; only the
+    # joint pick (BSD-3-Clause everywhere) is conflict-free.
+    big_ok_request = {
+        "product": "big-ok",
+        "components": [
+            {"id": "app", "license": "MIT"},
+            {"id": "gpl", "license": "GPL-2.0-only", "linkage": "static"},
+        ] + [
+            {"id": "lib%02d" % i, "license": "Apache-2.0 OR BSD-3-Clause",
+             "linkage": "static"}
+            for i in range(13)
+        ],
+        "dependencies": [{"from": "app", "to": "gpl"}]
+        + [{"from": "app", "to": "lib%02d" % i} for i in range(13)],
+    }
+    code, body = call("POST", "/v1/assessments", big_ok_request)
+    result = body.get("result", {})
+    check("big-space status ok",
+          result.get("status") == "ok" and result.get("release") is True,
+          result.get("status"))
+    check("big-space uses global search",
+          result.get("selection_mode") == "branch-and-bound",
+          str(result.get("selection_mode")))
+    adopted = result.get("adopted", {})
+    check(
+        "big-space adopts conflict-free branches",
+        all(adopted.get("lib%02d" % i) == "BSD-3-Clause" for i in range(13)),
+        str([v for k, v in sorted(adopted.items()) if v != "BSD-3-Clause" and k.startswith("lib")]),
+    )
+    check(
+        "big-space obligations minimal",
+        result.get("artifact_obligations")
+        == ["attribution", "license-text", "no-endorsement", "same-license", "source-offer"],
+        str(result.get("artifact_obligations")),
+    )
+    big_id = body.get("id")
+    big_hash = result.get("summary_hash")
+
+    permuted_big = {
+        "product": "big-ok",
+        "components": list(reversed(big_ok_request["components"])),
+        "dependencies": list(reversed(big_ok_request["dependencies"])),
+    }
+    code, body2 = call("POST", "/v1/assessments", permuted_big)
+    check(
+        "big-space input order invariance",
+        code == 200
+        and body2.get("id") == big_id
+        and body2.get("result", {}).get("summary_hash") == big_hash
+        and body2.get("created") is False,
+    )
+
+    code, conf = call("POST", "/v1/assessments/%s/confirm" % big_id)
+    check("big-space confirm", code == 200 and conf.get("status") == "confirmed")
+    replay = conf.get("replay", {})
+    code, body = call(
+        "POST", replay.get("endpoint", "").replace("POST ", ""), replay.get("request")
+    )
+    check("big-space replay reproduces summary",
+          code == 200 and body.get("id") == big_id
+          and body.get("result", {}).get("summary_hash") == big_hash)
+
+    # -- large OR space: every combination conflicts -> minimal set ----------
+    big_conflict_request = {
+        "product": "big-conflict",
+        "components": [
+            {"id": "app", "license": "MIT"},
+            {"id": "gpl", "license": "GPL-2.0-only", "linkage": "static"},
+            {"id": "docs", "license": "Unlicense"},
+        ] + [
+            {"id": "lib%02d" % i, "license": "Apache-2.0 OR GPL-3.0-only",
+             "linkage": "static"}
+            for i in range(13)
+        ],
+        "dependencies": [{"from": "app", "to": "gpl"}]
+        + [{"from": "app", "to": "lib%02d" % i} for i in range(13)],
+    }
+    code, body = call("POST", "/v1/assessments", big_conflict_request)
+    result = body.get("result", {})
+    check("big-space conflict status",
+          result.get("status") == "conflict" and result.get("release") is False)
+    check(
+        "big-space conflict minimal set",
+        result.get("conflicting_components")
+        == ["app", "gpl"] + ["lib%02d" % i for i in range(13)],
+        str(result.get("conflicting_components")),
+    )
+    confirmed_ids = [c["id"] for c in result.get("confirmed_subgraph", {}).get("components", [])]
+    check("big-space conflict confirmed subgraph", confirmed_ids == ["docs"])
+    code, body = call("POST", "/v1/assessments/%s/confirm" % body.get("id"))
+    check("big-space conflict cannot be confirmed", code == 409)
+
+    # -- >256 least-conflict combinations: complete conflict explanation ----
+    # 11 OR components -> 2048 combinations; 1024 of them tie at the minimal
+    # conflict count (10 each).  The explanation must aggregate *every* one
+    # of them: conflicts and participants that only appear in combinations
+    # beyond the first 256 still show up, and an OR component whose branch
+    # is forced at the minimal level (kconst) stays confirmed.
+    wide_components = [
+        {"id": "docs", "license": "Unlicense"},
+        {"id": "hub", "license": "MIT"},
+        {"id": "kg", "license": "GPL-2.0-only", "linkage": "static"},
+        {"id": "kconst", "license": "Apache-2.0 OR MIT", "linkage": "static"},
+        {"id": "hA", "license": "MIT"},
+        {"id": "hB", "license": "MIT"},
+        {"id": "fixA", "license": "GPL-2.0-only", "linkage": "static"},
+        {"id": "fixB", "license": "GPL-3.0-only", "linkage": "static"},
+        {"id": "mid", "license": "Apache-2.0 OR LGPL-2.1-only", "linkage": "static"},
+    ]
+    wide_deps = [
+        {"from": "hub", "to": "kg"},
+        {"from": "hub", "to": "kconst"},
+        {"from": "hA", "to": "fixA"},
+        {"from": "hA", "to": "mid"},
+        {"from": "hB", "to": "fixB"},
+        {"from": "hB", "to": "mid"},
+    ]
+    for i in range(9):
+        wide_components += [
+            {"id": "sub%d" % i, "license": "MIT"},
+            {"id": "pad%d" % i, "license": "GPL-2.0-only OR GPL-3.0-only",
+             "linkage": "static"},
+            {"id": "pfx%d" % i, "license": "EPL-2.0", "linkage": "static"},
+        ]
+        wide_deps += [
+            {"from": "sub%d" % i, "to": "pad%d" % i},
+            {"from": "sub%d" % i, "to": "pfx%d" % i},
+        ]
+    wide_request = {
+        "product": "wide-conflict",
+        "components": wide_components,
+        "dependencies": wide_deps,
+    }
+    code, body = call("POST", "/v1/assessments", wide_request)
+    result = body.get("result", {})
+    check("wide conflict status",
+          result.get("status") == "conflict" and result.get("release") is False)
+    expected_wide_components = sorted(
+        ["fixA", "fixB", "hA", "hB", "mid"]
+        + ["pad%d" % i for i in range(9)]
+        + ["pfx%d" % i for i in range(9)]
+        + ["sub%d" % i for i in range(9)]
+    )
+    check(
+        "wide conflict complete component set",
+        result.get("conflicting_components") == expected_wide_components,
+        str(result.get("conflicting_components")),
+    )
+    wide_keys = {
+        (c["type"], tuple(c["components"]), tuple(c["licenses"]))
+        for c in result.get("conflicts", [])
+    }
+    check(
+        "wide conflict count covers every least-conflict combination",
+        len(result.get("conflicts", [])) == 20,
+        str(len(result.get("conflicts", []))),
+    )
+    check(
+        "wide conflict includes late-combination conflicts",
+        ("incompatible-licenses", ("fixB", "hB", "mid"),
+         ("GPL-3.0-only", "LGPL-2.1-only")) in wide_keys
+        and ("incompatible-licenses", ("pad0", "pfx0", "sub0"),
+             ("EPL-2.0", "GPL-3.0-only")) in wide_keys,
+    )
+    confirmed_ids = [c["id"] for c in result.get("confirmed_subgraph", {}).get("components", [])]
+    check(
+        "wide conflict confirmed subgraph",
+        confirmed_ids == ["docs", "hub", "kconst", "kg"],
+        str(confirmed_ids),
+    )
+    wide_hash = result.get("summary_hash")
+
+    permuted_wide = {
+        "product": "wide-conflict",
+        "components": list(reversed(wide_request["components"])),
+        "dependencies": list(reversed(wide_request["dependencies"])),
+    }
+    code, body2 = call("POST", "/v1/assessments", permuted_wide)
+    check(
+        "wide conflict input order invariance",
+        code == 200 and body2.get("result", {}).get("summary_hash") == wide_hash,
+    )
+
+    # -- solver equivalence: branch-and-bound == exhaustive enumeration ------
+    from app import solver
+
+    def solve_with_cap(request, cap):
+        old = solver.MAX_COMBINATIONS
+        solver.MAX_COMBINATIONS = cap
+        try:
+            return solver.assess(request, validate_ruleset(DEFAULT_RULESET))
+        finally:
+            solver.MAX_COMBINATIONS = old
+
+    def stripped(result):
+        return {
+            k: v for k, v in result.items()
+            if k not in ("selection_mode", "summary_hash")
+        }
+
+    overflow_components = [{"id": "docs", "license": "Unlicense"}]
+    overflow_deps = []
+    for i in range(9):
+        overflow_components += [
+            {"id": "sub%d" % i, "license": "MIT"},
+            {"id": "lib%d" % i, "license": "GPL-2.0-only OR GPL-3.0-only",
+             "linkage": "static"},
+            {"id": "fix%d" % i, "license": "EPL-2.0", "linkage": "static"},
+        ]
+        overflow_deps += [
+            {"from": "sub%d" % i, "to": "lib%d" % i},
+            {"from": "sub%d" % i, "to": "fix%d" % i},
+        ]
+    battery = [
+        ok_request, conflict_request, clash_request, unsat_request, exc_request,
+        {   # lexicographic tie-break among equal-obligation branches
+            "components": [
+                {"id": "app", "license": "ISC"},
+                {"id": "l1", "license": "MIT OR BSD-2-Clause"},
+                {"id": "l2", "license": "BSD-2-Clause OR MIT"},
+            ],
+            "dependencies": [{"from": "app", "to": "l1"}, {"from": "app", "to": "l2"}],
+        },
+        {   # conflict only visible at the top of a dependency chain
+            "components": [
+                {"id": "top", "license": "MIT"},
+                {"id": "mid", "license": "Apache-2.0 OR BSD-3-Clause", "linkage": "static"},
+                {"id": "leaf", "license": "GPL-2.0-only OR MIT", "linkage": "static"},
+            ],
+            "dependencies": [{"from": "top", "to": "mid"}, {"from": "mid", "to": "leaf"}],
+        },
+        {   # same-license clash avoidable through either of two OR branches
+            "components": [
+                {"id": "app", "license": "MIT"},
+                {"id": "l1", "license": "GPL-2.0-only OR MIT", "linkage": "static"},
+                {"id": "l2", "license": "GPL-3.0-only OR ISC", "linkage": "static"},
+            ],
+            "dependencies": [{"from": "app", "to": "l1"}, {"from": "app", "to": "l2"}],
+        },
+        {   # >256 least-conflict combinations: aggregation must stay complete
+            "components": overflow_components,
+            "dependencies": overflow_deps,
+        },
+        {   # self-conflicting AND expression, no OR branch at all
+            "components": [{"id": "x", "license": "Apache-2.0 AND GPL-2.0-only"}],
+        },
+        big_ok_request,      # 8192 combinations
+        big_conflict_request,  # 8192 combinations, all conflicting
+        wide_request,        # 2048 combinations, 1024 least-conflict ones
+    ]
+    for i, req in enumerate(battery):
+        exhaustive = solve_with_cap(req, 10**9)
+        search = solve_with_cap(req, 0)
+        check(
+            "search matches exhaustive #%d" % (i + 1),
+            stripped(search) == stripped(exhaustive),
+            "statuses %s / %s" % (exhaustive.get("status"), search.get("status")),
+        )
+    check(
+        "selection modes reported",
+        solve_with_cap(ok_request, 10**9).get("selection_mode") == "exhaustive"
+        and solve_with_cap(ok_request, 0).get("selection_mode") == "branch-and-bound",
+    )
+
+    # -- randomized equivalence fuzz (deterministic seed) --------------------
+    import random
+
+    rng = random.Random(20240924)
+    fuzz_licenses = ["MIT", "Apache-2.0", "GPL-2.0-only", "GPL-3.0-only",
+                     "LGPL-2.1-only", "BSD-3-Clause", "MPL-2.0", "EPL-2.0"]
+
+    def rand_expr():
+        def leaf():
+            return fuzz_licenses[int(rng.random() * len(fuzz_licenses))]
+        r = rng.random()
+        if r < 0.5:
+            return leaf()
+        if r < 0.85:
+            return "%s OR %s" % (leaf(), leaf())
+        return "%s AND (%s OR %s)" % (leaf(), leaf(), leaf())
+
+    mismatches = 0
+    for _trial in range(40):
+        n = 2 + int(rng.random() * 5)
+        comps = [
+            {
+                "id": "c%d" % i,
+                "license": rand_expr(),
+                "linkage": ("static", "dynamic", "process", "none")[int(rng.random() * 4)],
+            }
+            for i in range(n)
+        ]
+        deps = [
+            {"from": "c%d" % j, "to": "c%d" % i}
+            for i in range(n)
+            for j in range(i + 1, n)
+            if rng.random() < 0.4
+        ]
+        dist = ("internal", "binary", "source", "saas")[int(rng.random() * 4)]
+        req = {"components": comps, "dependencies": deps, "distribution": dist}
+        if stripped(solve_with_cap(req, 0)) != stripped(solve_with_cap(req, 10**9)):
+            mismatches += 1
+    check("randomized search/exhaustive equivalence", mismatches == 0,
+          "%d mismatches" % mismatches)
+
+    # -- fulfillment checks --------------------------------------------------
+    run_fulfillment_checks(call, check, conflict_aid)
+    run_fulfillment_fuzz(check)
+
+    # -- obligation schedule checks ------------------------------------------
+    run_schedule_checks(call, check, conflict_aid)
+
+    # -- responsibility plan checks ------------------------------------------
+    run_plan_checks(call, check, conflict_aid)
+    run_plan_fuzz(check)
+
+    # -- remediation plan checks ---------------------------------------------
+    run_remediation_checks(call, check)
+
+    # -- assessment comparison checks ----------------------------------------
+    run_compare_checks(call, check)
+
+
+def run_deep_expression_checks():
+    """Deeply nested SPDX expressions (hundreds of parenthesis/operator
+    levels) must not crash the assessment: parsing, AST traversal and
+    OR-branch expansion are iterative, so nothing depends on the Python
+    call stack.  Legal deep expressions must produce exactly the same
+    adopted branches, obligations, conflict explanations and summary_hash
+    as their flat equivalents; illegal deep input still yields
+    invalid-expression with accurate positions."""
+    from app.solver import assess
+
+    rules = validate_ruleset(DEFAULT_RULESET)
+
+    # -- the reported crash: 250 levels of parentheses around a license -----
+    deep_mit = "(" * 250 + "MIT" + ")" * 250
+    code, body = call("POST", "/v1/assessments",
+                      {"components": [{"id": "solo", "license": deep_mit}]})
+    result = body.get("result", {})
+    check("deep parens: 200 ok, no recursion crash",
+          code == 200 and result.get("status") == "ok"
+          and result.get("release") is True
+          and result.get("adopted", {}).get("solo") == "MIT",
+          "%s %s" % (code, json.dumps(result)[:120]))
+
+    # -- deep legal expressions == flat equivalents (end to end) -------------
+    flat_ok = {
+        "product": "deep-eq",
+        "distribution": "binary",
+        "components": [
+            {"id": "app", "license": "MIT"},
+            {"id": "liba", "license": "Apache-2.0 OR MIT", "linkage": "static"},
+            {"id": "libb", "license": "GPL-2.0-only", "linkage": "static"},
+            {"id": "rt", "license": "GPL-2.0-only WITH Classpath-exception-2.0",
+             "linkage": "static"},
+        ],
+        "dependencies": [{"from": "app", "to": c} for c in ("liba", "libb", "rt")],
+    }
+    deep_ok = json.loads(json.dumps(flat_ok))
+    deep_ok["components"][0]["license"] = "(" * 250 + "MIT" + ")" * 250
+    deep_ok["components"][1]["license"] = "(" * 250 + "Apache-2.0 OR MIT" + ")" * 250
+    deep_ok["components"][2]["license"] = "(" * 120 + "GPL-2.0-only" + ")" * 120
+    deep_ok["components"][3]["license"] = ("(" * 100 + "GPL-2.0-only" + ")" * 100
+                                           + " WITH Classpath-exception-2.0")
+    code, body_flat = call("POST", "/v1/assessments", flat_ok)
+    code2, body_deep = call("POST", "/v1/assessments", deep_ok)
+    res_flat, res_deep = body_flat.get("result", {}), body_deep.get("result", {})
+    check("deep == flat: adopted branches, obligations and summary_hash",
+          code == 200 and code2 == 200
+          and res_deep.get("status") == "ok"
+          and res_deep == res_flat
+          and res_deep.get("adopted", {}).get("liba") == "MIT",
+          "hashes %s / %s"
+          % (res_flat.get("summary_hash"), res_deep.get("summary_hash")))
+
+    # input order invariance also holds for the deep form
+    permuted_deep = {
+        "product": "deep-eq",
+        "distribution": "binary",
+        "components": list(reversed(deep_ok["components"])),
+        "dependencies": list(reversed(deep_ok["dependencies"])),
+    }
+    code, body2 = call("POST", "/v1/assessments", permuted_deep)
+    check("deep expression input order invariance",
+          code == 200
+          and body2.get("id") == body_deep.get("id")
+          and body2.get("result", {}).get("summary_hash")
+          == res_deep.get("summary_hash")
+          and body2.get("created") is False)
+
+    # -- deep conflict expression == flat conflict explanation ---------------
+    flat_conflict = json.loads(json.dumps(flat_ok))
+    flat_conflict["components"][1]["license"] = "Apache-2.0"
+    deep_conflict = json.loads(json.dumps(deep_ok))
+    deep_conflict["components"][1]["license"] = "(" * 250 + "Apache-2.0" + ")" * 250
+    _, body_flat = call("POST", "/v1/assessments", flat_conflict)
+    _, body_deep = call("POST", "/v1/assessments", deep_conflict)
+    res_flat, res_deep = body_flat.get("result", {}), body_deep.get("result", {})
+    check("deep == flat: conflict explanation and summary_hash",
+          res_deep.get("status") == "conflict"
+          and res_deep.get("release") is False
+          and res_deep == res_flat
+          and res_deep.get("conflicting_components")
+          == ["app", "liba", "libb", "rt"],
+          str(res_deep.get("conflicting_components")))
+
+    # -- solver-level battery: deep operator nesting vs flat -----------------
+    nest_and = "MIT"
+    for _ in range(250):
+        nest_and = "MIT AND (%s)" % nest_and
+    nest_or = "BSD-2-Clause"
+    for _ in range(250):
+        nest_or = "(%s) OR BSD-3-Clause" % nest_or
+    pairs = [
+        ("(" * 250 + "MIT" + ")" * 250, "MIT"),
+        ("(" * 250 + "Apache-2.0 OR MIT" + ")" * 250, "Apache-2.0 OR MIT"),
+        (nest_and, " AND ".join(["MIT"] * 251)),
+        (nest_or, " OR ".join(["BSD-2-Clause"] + ["BSD-3-Clause"] * 250)),
+        ("(" * 100 + "GPL-3.0-only" + ")" * 100 + " WITH Classpath-exception-2.0",
+         "GPL-3.0-only WITH Classpath-exception-2.0"),
+        ("(" * 200 + "(Apache-2.0 OR MIT) AND (GPL-2.0-only OR MIT)" + ")" * 200,
+         "(Apache-2.0 OR MIT) AND (GPL-2.0-only OR MIT)"),
+        ("MIT AND (" * 100 + "ISC" + ")" * 100,
+         " AND ".join(["MIT"] * 100 + ["ISC"])),
+    ]
+    mismatches = []
+    for deep_expr, flat_expr in pairs:
+        r_deep = assess({"components": [{"id": "x", "license": deep_expr}]}, rules)
+        r_flat = assess({"components": [{"id": "x", "license": flat_expr}]}, rules)
+        if r_deep != r_flat:
+            mismatches.append(flat_expr[:40])
+    check("deep operator nesting == flat equivalents (incl. summary_hash)",
+          mismatches == [], str(mismatches))
+
+    # -- no call-stack dependence: works under a tiny recursion limit --------
+    very_deep = "(" * 2000 + "Apache-2.0 OR MIT" + ")" * 2000
+    deep_ast = "MIT"
+    for _ in range(1000):
+        deep_ast = "MIT AND (%s)" % deep_ast
+    old_limit = sys.getrecursionlimit()
+    err = None
+    try:
+        sys.setrecursionlimit(200)
+        try:
+            r1 = assess({"components": [{"id": "x", "license": very_deep}]}, rules)
+            r2 = assess({"components": [{"id": "x", "license": "Apache-2.0 OR MIT"}]},
+                        rules)
+            r3 = assess({"components": [{"id": "x", "license": deep_ast}]}, rules)
+            r4 = assess({"components": [{"id": "x", "license": "MIT"}]}, rules)
+        except RecursionError:
+            err = "RecursionError"
+    finally:
+        sys.setrecursionlimit(old_limit)
+    check("deep expressions need no call-stack depth (recursion limit 200)",
+          err is None and r1 == r2 and r3 == r4 and r1.get("status") == "ok",
+          err or "")
+
+    # -- deep illegal input: invalid-expression with accurate positions ------
+    for expr, msg, pos in [
+        ("(" * 250 + "MIT", "missing closing parenthesis", -1),
+        ("(" * 250 + "MIT AND)", "expected license id or '('", 257),
+        ("(" * 250 + "MIT WITH)", "expected exception name after WITH", 258),
+        ("(" * 250 + "MIT OR MIT) WITH E" + ")" * 249,
+         "WITH must follow a license id", 250 + len("MIT OR MIT) WITH ")),
+    ]:
+        code, body = call("POST", "/v1/assessments",
+                          {"components": [{"id": "x", "license": expr}]})
+        result = body.get("result", {})
+        check("deep invalid-expression: %s" % msg,
+              code == 200
+              and result.get("status") == "invalid-expression"
+              and result.get("release") is False
+              and result.get("errors")
+              == [{"component": "x", "message": msg, "position": pos}]
+              and result.get("conflicting_components") == ["x"],
+              json.dumps(result.get("errors")))
+
+
+def run_fulfillment_checks(call, check, conflict_aid):
+    """End-to-end checks for POST /v1/assessments/{id}/fulfillment-check."""
+    # an assessment whose license carries three custom obligations so the
+    # check is self-contained (independent of default ruleset vocabulary)
+    fc_rules = {
+        "licenses": {
+            "FC-1.0": {"obligations": ["x", "y", "z"]},
+        }
+    }
+    fc_request = {
+        "product": "fc-product",
+        "components": [
+            {"id": "a", "license": "FC-1.0"},
+            {"id": "b", "license": "FC-1.0"},
+        ],
+        "rules": fc_rules,
+    }
+    code, body = call("POST", "/v1/assessments", fc_request)
+    fc_aid = body.get("id")
+    fc_hash = body.get("result", {}).get("summary_hash")
+    check("fulfillment: fixture assessment ok",
+          code == 200 and body.get("result", {}).get("status") == "ok",
+          json.dumps(body)[:200])
+
+# Classic set-cover greedy trap (Vazirani-style).  Six instances
+    # (two components x three obligations):
+    #   m-g (tg, product)            -> {x@a,y@a,x@b,y@b}  greedy bait (4)
+    #   m-a (ta, component a)        -> {x@a,y@a,z@a}
+    #   m-b (tb, component b)        -> {x@b,y@b,z@b}
+    #   m-c (tc, component a)        -> {z@a}
+    #   m-d (td, component b)        -> {z@b}
+    # Item-by-item greedy takes m-g (largest, 4) and then still needs z@a
+    # and z@b -> 3 materials.  The GLOBAL optimum is {m-a, m-b}: exactly
+    # 2 materials covering all six instances.
+    trap_materials = [
+        {"id": "m-g", "digest": "g", "type": "tg", "scope": "product"},
+        {"id": "m-a", "digest": "a", "type": "ta",
+         "scope": "component", "component": "a"},
+        {"id": "m-b", "digest": "b", "type": "tb",
+         "scope": "component", "component": "b"},
+        {"id": "m-c", "digest": "c", "type": "tc",
+         "scope": "component", "component": "a"},
+        {"id": "m-d", "digest": "d", "type": "td",
+         "scope": "component", "component": "b"},
+    ]
+    trap_rules = {
+        "obligations": {
+            "x": {"any": [
+                {"type": "tg"},
+                {"all": [{"type": "ta"}, {"component": "a"}]},
+                {"all": [{"type": "tb"}, {"component": "b"}]},
+            ]},
+            "y": {"any": [
+                {"type": "tg"},
+                {"all": [{"type": "ta"}, {"component": "a"}]},
+                {"all": [{"type": "tb"}, {"component": "b"}]},
+            ]},
+            "z": {"any": [
+                {"all": [{"type": "ta"}, {"scope": "component", "component": "a"}]},
+                {"all": [{"type": "tb"}, {"scope": "component", "component": "b"}]},
+                {"all": [{"type": "tc"}, {"scope": "component", "component": "a"}]},
+                {"all": [{"type": "td"}, {"scope": "component", "component": "b"}]},
+            ]},
+        }
+    }
+    trap_body = {"materials": trap_materials, "rules": trap_rules}
+
+    code, out = call("POST", "/v1/assessments/%s/fulfillment-check" % fc_aid, trap_body)
+    check(
+        "fulfillment: global optimum beats per-item greedy",
+        code == 200 and out.get("ready") is True
+        and out.get("selected_materials") == ["m-a", "m-b"],
+        json.dumps(out.get("selected_materials")) if code == 200 else json.dumps(out)[:200],
+    )
+    check("fulfillment: all six instances satisfied",
+          out.get("instances_satisfied") == 6 and out.get("instances_total") == 6)
+    check("fulfillment: hit trace complete",
+          sorted((h["material_id"], len(h["instances"])) for h in out.get("hits", []))
+          == [("m-a", 3), ("m-b", 3)])
+    check("fulfillment: unused materials reported",
+          out.get("unused_materials") == ["m-c", "m-d", "m-g"])
+    check("fulfillment: per-instance satisfied_by trace (selected coverers only)",
+          {(s["component"], s["obligation"]): s["satisfied_by"]
+           for s in out.get("satisfied", [])}
+          == {
+              ("a", "x"): ["m-a"], ("a", "y"): ["m-a"], ("a", "z"): ["m-a"],
+              ("b", "x"): ["m-b"], ("b", "y"): ["m-b"], ("b", "z"): ["m-b"],
+          })
+    trap_hash = out.get("fulfillment_hash")
+
+    # adding two universal product materials gives a strictly better plan:
+    # a single universal material covers all six instances
+    full_materials = trap_materials + [
+        {"id": "m-u1", "digest": "u1", "type": "tu", "scope": "product"},
+        {"id": "m-u2", "digest": "u2", "type": "tu", "scope": "product"},
+    ]
+    full_rules = {
+        "obligations": {
+            ob: {"any": [{"type": "tu"}]} for ob in ("x", "y", "z")
+        }
+    }
+    # rules must accept the trap materials as well to make the comparison
+    # meaningful; build combined rules
+    for ob, node in trap_rules["obligations"].items():
+        full_rules["obligations"][ob] = {"any": node["any"] + [{"type": "tu"}]}
+    code, out = call("POST", "/v1/assessments/%s/fulfillment-check" % fc_aid,
+                     {"materials": full_materials, "rules": full_rules})
+    check("fulfillment: fully covered -> ready=true, minimum materials",
+          code == 200 and out.get("ready") is True
+          and out.get("instances_satisfied") == 6
+          and out.get("selected_materials") == ["m-u1"],
+          json.dumps(out.get("selected_materials")) if code == 200 else json.dumps(out)[:200])
+
+    # input-order invariance: shuffle materials and every all/any array
+    import random as _rnd
+    rng = _rnd.Random(7)
+    shuffled = {"materials": trap_materials[:],
+                "rules": {"obligations": dict(trap_rules["obligations"])}}
+    rng.shuffle(shuffled["materials"])
+
+    def _shuffle_nodes(node):
+        if "all" in node or "any" in node:
+            key = "all" if "all" in node else "any"
+            rng.shuffle(node[key])
+            for ch in node[key]:
+                _shuffle_nodes(ch)
+
+    for ob in shuffled["rules"]["obligations"].values():
+        _shuffle_nodes(ob)
+    code, out2 = call("POST", "/v1/assessments/%s/fulfillment-check" % fc_aid, shuffled)
+    check(
+        "fulfillment: material/rule order does not change result",
+        code == 200
+        and out2.get("selected_materials") == ["m-a", "m-b"]
+        and out2.get("fulfillment_hash") == trap_hash,
+    )
+
+    # -- lexicographic tie-break among equally minimal selections -----------
+    tie_body = {
+        "materials": [
+            {"id": "zzz", "digest": "z1", "type": "type-a", "scope": "product"},
+            {"id": "aaa", "digest": "a1", "type": "type-a", "scope": "product"},
+        ],
+        "rules": {"obligations": {
+            "x": {"type": "type-a"}, "y": {"type": "type-a"}, "z": {"type": "type-a"},
+        }},
+    }
+    # every obligation accepts type-a, so all 6 instances are satisfied
+    # by one product item; aaa wins the equal-coverage/equal-count tie
+    code, out = call("POST", "/v1/assessments/%s/fulfillment-check" % fc_aid, tie_body)
+    check("fulfillment: lexicographic id tie-break",
+          code == 200 and out.get("ready") and out.get("selected_materials") == ["aaa"],
+          json.dumps(out.get("selected_materials")) if code == 200 else str(out))
+
+    # -- product-level material covers every applicable component -----------
+    prod_body = {
+        "materials": [
+            {"id": "ca", "digest": "1", "type": "type-a",
+             "scope": "component", "component": "a"},
+            {"id": "pa", "digest": "2", "type": "type-a", "scope": "product"},
+        ],
+        "rules": {"obligations": {
+            "x": {"type": "type-a"}, "y": {"type": "type-a"}, "z": {"type": "type-a"},
+        }},
+    }
+    code, out = call("POST", "/v1/assessments/%s/fulfillment-check" % fc_aid, prod_body)
+    check("fulfillment: product material globally preferred",
+          code == 200 and out.get("selected_materials") == ["pa"]
+          and out.get("instances_satisfied") == 6)
+
+    # -- multiple materials jointly satisfy an `all` rule ------------------
+    # Regression: the rule used to be evaluated per material, so no single
+    # material matching the whole conjunction produced ready=false with an
+    # empty hit trace and no-matching-material, even though two materials
+    # jointly cover the two conjunct leaves.
+    joint_rules = {"obligations": {
+        "x": {"all": [{"type": "notice"}, {"type": "license-copy"}]},
+        "y": {"all": [{"type": "notice"}, {"any": [
+            {"type": "license-copy"}, {"type": "full-bundle"}]}]},
+        "z": {"all": [
+            {"type": "notice"},
+            {"any": [{"scope": "component"}, {"type": "full-bundle"}]},
+        ]},
+    }}
+    joint_body = {
+        "materials": [
+            {"id": "signed", "digest": "sg", "type": "notice", "scope": "product"},
+            {"id": "copy-a", "digest": "ca", "type": "license-copy",
+             "scope": "component", "component": "a"},
+            {"id": "copy-b", "digest": "cb", "type": "license-copy",
+             "scope": "component", "component": "b"},
+        ],
+        "rules": joint_rules,
+    }
+    code, out = call("POST", "/v1/assessments/%s/fulfillment-check" % fc_aid, joint_body)
+    by_inst = {(s["component"], s["obligation"]): s["satisfied_by"]
+               for s in out.get("satisfied", [])}
+    hits_by_mat = {h["material_id"]: {(i["component"], i["obligation"])
+                                      for i in h["instances"]}
+                   for h in out.get("hits", [])}
+    check(
+        "fulfillment: all satisfied jointly across materials",
+        code == 200 and out.get("ready") is True
+        and out.get("instances_satisfied") == 6
+        and out.get("selected_materials") == ["copy-a", "copy-b", "signed"],
+        json.dumps(out, sort_keys=True)[:300] if code == 200 else str(out),
+    )
+    check(
+        "fulfillment: joint-all per-instance witnesses and hit trace",
+        by_inst == {
+            ("a", "x"): ["copy-a", "signed"],
+            ("a", "y"): ["copy-a", "signed"],
+            ("a", "z"): ["copy-a", "signed"],
+            ("b", "x"): ["copy-b", "signed"],
+            ("b", "y"): ["copy-b", "signed"],
+            ("b", "z"): ["copy-b", "signed"],
+        }
+        and hits_by_mat == {
+            "signed": {("a", "x"), ("a", "y"), ("a", "z"),
+                       ("b", "x"), ("b", "y"), ("b", "z")},
+            "copy-a": {("a", "x"), ("a", "y"), ("a", "z")},
+            "copy-b": {("b", "x"), ("b", "y"), ("b", "z")},
+        },
+        json.dumps(out, sort_keys=True)[:400],
+    )
+    joint_hash = out.get("fulfillment_hash")
+
+    # rule/material order (incl. all/any array order) must not change it
+    import random as _rnd2
+    r2 = _rnd2.Random(123)
+    sh = {"materials": list(joint_body["materials"]),
+          "rules": {"obligations": {k: v for k, v in joint_rules["obligations"].items()}}}
+    r2.shuffle(sh["materials"])
+
+    def _shuf(n):
+        for key in ("all", "any"):
+            if key in n:
+                r2.shuffle(n[key])
+                for ch in n[key]:
+                    _shuf(ch)
+    for n in sh["rules"]["obligations"].values():
+        _shuf(n)
+    code, out2 = call("POST", "/v1/assessments/%s/fulfillment-check" % fc_aid, sh)
+    check("fulfillment: joint-all order invariant",
+          code == 200 and out2.get("fulfillment_hash") == joint_hash)
+
+    # a single material alone is not enough -> incomplete-evidence gap,
+    # but it must still appear in the best partial plan with a hit trace
+    partial_body = {
+        "materials": [
+            {"id": "signed", "digest": "sg", "type": "notice", "scope": "product"},
+        ],
+        "rules": {"obligations": {
+            "x": {"all": [{"type": "notice"}, {"type": "license-copy"}]},
+            "y": {"all": [{"type": "notice"}, {"type": "license-copy"}]},
+            "z": {"type": "notice"},
+        }},
+    }
+    code, out = call("POST", "/v1/assessments/%s/fulfillment-check" % fc_aid, partial_body)
+    gaps = {(g["component"], g["obligation"]): g for g in out.get("gaps", [])}
+    check(
+        "fulfillment: partial all -> incomplete-evidence with precise leaves",
+        code == 200 and out.get("ready") is False
+        and out.get("instances_satisfied") == 2
+        and out.get("selected_materials") == ["signed"]
+        and all(g.get("reason") == "incomplete-evidence" for g in gaps.values())
+        and all(g.get("missing_leaves") == [{"type": "license-copy"}]
+                for g in gaps.values())
+        and all(g.get("candidate_materials") == ["signed"] for g in gaps.values()),
+        json.dumps(out.get("gaps"), sort_keys=True)[:300] if code == 200 else str(out),
+    )
+    check(
+        "fulfillment: partial plan keeps per-material hit trace",
+        [h["material_id"] for h in out.get("hits", [])] == ["signed"]
+        and {(i["component"], i["obligation"])
+             for i in out.get("hits", [{}])[0].get("instances", [])}
+        == {("a", "z"), ("b", "z")},
+        json.dumps(out.get("hits"), sort_keys=True)[:300],
+    )
+
+    # totally unmatched rule keeps the no-matching-material semantics
+    nomatch_body = {
+        "materials": [
+            {"id": "signed", "digest": "sg", "type": "notice", "scope": "product"},
+        ],
+        "rules": {"obligations": {
+            "x": {"type": "source-archive"}, "y": {"type": "source-archive"},
+            "z": {"all": [{"type": "source-archive"}, {"scope": "component"}]},
+        }},
+    }
+    code, out = call("POST", "/v1/assessments/%s/fulfillment-check" % fc_aid, nomatch_body)
+    check(
+        "fulfillment: no leaf hit -> no-matching-material and empty traces",
+        code == 200 and out.get("ready") is False
+        and out.get("instances_satisfied") == 0
+        and out.get("selected_materials") == []
+        and out.get("hits") == []
+        and {g["reason"] for g in out.get("gaps", [])} == {"no-matching-material"}
+        and all(not g.get("missing_leaves") for g in out.get("gaps", [])),
+        json.dumps(out, sort_keys=True)[:300] if code == 200 else str(out),
+    )
+
+    # -- component material covers only its declared object -----------------
+    comp_body = {
+        "materials": [
+            {"id": "ca", "digest": "1", "type": "type-a",
+             "scope": "component", "component": "a"},
+        ],
+        "rules": {"obligations": {
+            "x": {"all": [{"type": "type-a"}, {"scope": "component"}]},
+            "y": {"all": [{"type": "type-a"}, {"scope": "component"}]},
+            "z": {"all": [{"type": "type-a"}, {"scope": "component"}]},
+        }},
+    }
+    code, out = call("POST", "/v1/assessments/%s/fulfillment-check" % fc_aid, comp_body)
+    gap_components = sorted(g["component"] for g in out.get("gaps", []))
+    check("fulfillment: component material scoped to declared object",
+          code == 200 and out.get("ready") is False
+          and out.get("instances_satisfied") == 3
+          and gap_components == ["b", "b", "b"],
+          json.dumps(out.get("gaps"))[:200] if code == 200 else str(out))
+
+    # -- same digest counts once; identical metadata collapses --------------
+    dup_body = {
+        "materials": [
+            {"id": "z-second", "digest": "SAME", "type": "type-a", "scope": "product"},
+            {"id": "a-first", "digest": "SAME", "type": "type-a", "scope": "product"},
+        ],
+        "rules": {"obligations": {
+            "x": {"type": "type-a"}, "y": {"type": "type-a"}, "z": {"type": "type-a"},
+        }},
+    }
+    code, out = call("POST", "/v1/assessments/%s/fulfillment-check" % fc_aid, dup_body)
+    check("fulfillment: same digest counted once (smallest id canonical)",
+          code == 200 and out.get("ready") is True
+          and out.get("selected_materials") == ["a-first"]
+          and out.get("deduplicated", [{}])[0].get("duplicate_ids")
+          == ["a-first", "z-second"])
+
+    # -- same digest with conflicting metadata -> 422 -----------------------
+    conflict_body = {
+        "materials": [
+            {"id": "one", "digest": "SAME", "type": "type-a", "scope": "product"},
+            {"id": "two", "digest": "SAME", "type": "type-a",
+             "scope": "component", "component": "a"},
+        ],
+        "rules": {"obligations": {"x": {"type": "type-a"}}},
+    }
+    code, out = call("POST", "/v1/assessments/%s/fulfillment-check" % fc_aid, conflict_body)
+    check("fulfillment: digest metadata conflict -> 422", code == 422, str(out)[:120])
+
+    # -- malformed payloads -> 400 ------------------------------------------
+    for bad, label in [
+        ({}, "no body fields"),
+        ({"materials": [], "rules": {"obligations": {"x": {"type": "t"}}}}, "empty materials"),
+        ({"materials": [{"id": "m", "digest": "d", "type": "t", "scope": "bogus"}],
+          "rules": {"obligations": {"x": {"type": "t"}}}}, "bad scope"),
+        ({"materials": [{"id": "m", "digest": "d", "type": "t", "scope": "component"}],
+          "rules": {"obligations": {"x": {"type": "t"}}}}, "component missing target"),
+        ({"materials": [{"id": "m", "digest": "d", "type": "t"}],
+          "rules": {"obligations": {"x": {"type": "t"}}}}, "missing scope"),
+        ({"materials": [{"id": "m", "digest": "d", "type": "t", "scope": "product"}],
+          "rules": {}}, "missing rules"),
+        ({"materials": [{"id": "m", "digest": "d", "type": "t", "scope": "product"}],
+          "rules": {"obligations": {"x": {"all": [], "any": []}}}}, "all+any"),
+        ({"materials": [{"id": "m", "digest": "d", "type": "t", "scope": "product"}],
+          "rules": {"obligations": {"x": {"all": [{"scope": "component",
+                                                   "component": "ghost"}]}}}},
+         "unknown rule component"),
+        ({"materials": [{"id": "m", "digest": "d", "type": "t",
+                         "scope": "product", "component": "a"}],
+          "rules": {"obligations": {"x": {"type": "t"}}}}, "product material with component"),
+        ({"materials": [{"id": "m", "digest": "d", "type": "t", "scope": "product"},
+                        {"id": "m", "digest": "d2", "type": "t", "scope": "product"}],
+          "rules": {"obligations": {"x": {"type": "t"}}}}, "duplicate material id"),
+    ]:
+        code, out = call("POST", "/v1/assessments/%s/fulfillment-check" % fc_aid, bad)
+        check("fulfillment: 400 on %s" % label, code == 400, str(out)[:100])
+
+    # -- missing evidence rule -> concrete gap ------------------------------
+    norule_body = {
+        "materials": [{"id": "m", "digest": "d", "type": "type-a", "scope": "product"}],
+        "rules": {"obligations": {"x": {"type": "type-a"}, "y": {"type": "type-a"}}},
+    }
+    code, out = call("POST", "/v1/assessments/%s/fulfillment-check" % fc_aid, norule_body)
+    reasons = {(g["component"], g["obligation"]): g["reason"] for g in out.get("gaps", [])}
+    check("fulfillment: missing rule reported as no-evidence-rule",
+          code == 200 and out.get("ready") is False
+          and all(v == "no-evidence-rule" for v in reasons.values())
+          and sorted(reasons) == [("a", "z"), ("b", "z")],
+          str(reasons))
+
+    # -- non-ok assessment -> 409, no fulfillment conclusion ----------------
+    code, out = call("POST", "/v1/assessments/%s/fulfillment-check" % conflict_aid,
+                     {"materials": [{"id": "m", "digest": "d", "type": "t",
+                                     "scope": "product"}],
+                      "rules": {"obligations": {"x": {"type": "t"}}}})
+    check("fulfillment: non-ok assessment -> 409", code == 409, str(out)[:120])
+
+    # unknown assessment -> 404
+    code, out = call("POST", "/v1/assessments/%s/fulfillment-check" % ("f" * 32),
+                     {"materials": [{"id": "m", "digest": "d", "type": "t",
+                                     "scope": "product"}],
+                      "rules": {"obligations": {"x": {"type": "t"}}}})
+    check("fulfillment: unknown assessment -> 404", code == 404)
+
+    # -- statelessness: the assessment result itself is untouched -----------
+    code, body = call("GET", "/v1/assessments/%s" % fc_aid)
+    check("fulfillment: assessment result unchanged",
+          body.get("result", {}).get("summary_hash") == fc_hash)
+
+    # -- large material space: branch-and-bound path, still exact -----------
+    # 20 distinct materials with pairwise different types; every obligation
+    # accepts every type -> equal coverage columns survive domination,
+    # forcing the branch-and-bound path; lexicographically smallest wins.
+    big_materials = [
+        {"id": "mm%02d" % i, "digest": "big-%02d" % i,
+         "type": "tt%02d" % i, "scope": "product"}
+        for i in range(20)
+    ]
+    big_rules = {"obligations": {
+        o: {"any": [{"type": "tt%02d" % i} for i in range(20)]}
+        for o in ("x", "y", "z")
+    }}
+    code, out = call("POST", "/v1/assessments/%s/fulfillment-check" % fc_aid,
+                     {"materials": big_materials, "rules": big_rules})
+    check("fulfillment: large space selects branch-and-bound",
+          code == 200 and out.get("selection_mode") == "branch-and-bound"
+          and out.get("ready") is True and out.get("instances_satisfied") == 6,
+          json.dumps(out)[:200] if code == 200 else str(out))
+    check("fulfillment: large space exact minimum with id tie-break",
+          out.get("selected_materials") == ["mm00"],
+          str(out.get("selected_materials")))
+
+
+def run_fulfillment_fuzz(check):
+    """Randomized exactness checks for the fulfillment optimizer."""
+    import itertools
+    import random
+
+    from app.fulfillment import (
+        check_fulfillment,
+        solve_branch_bound,
+        solve_exhaustive,
+    )
+
+    rng = random.Random(20260925)
+
+    # -- solver-level fuzz: random compiled formulas ----------------------
+    # Each instance gets a small random monotone formula over random
+    # leaves; each material matches a random subset of those leaves.
+    # The brute-force oracle applies the set-accumulation semantics
+    # (a leaf holds iff any selected material matches it).
+    def make_formula(depth, nleaves):
+        if depth <= 0 or (nleaves and rng.random() < 0.35):
+            return ("l", rng.randrange(nleaves)) if nleaves else ("l", 0)
+        comb = "a" if rng.random() < 0.5 else "o"
+        children = [make_formula(depth - 1, nleaves)
+                    for _ in range(rng.randint(2, 3))]
+        return (comb, tuple(children))
+
+    def flatten(t, nleaves, gates_out):
+        kind = t[0]
+        if kind == "l":
+            return t[1]
+        ins = [flatten(ch, nleaves, gates_out) for ch in t[1]]
+        gi = nleaves + len(gates_out)
+        mask = 0
+        for j in ins:
+            mask |= 1 << j
+        gates_out.append((kind, mask))
+        return gi
+
+    def eval_tuple(t, truth):
+        if t[0] == "l":
+            return bool((truth >> t[1]) & 1)
+        vals = [eval_tuple(ch, truth) for ch in t[1]]
+        return all(vals) if t[0] == "a" else any(vals)
+
+    mismatches = 0
+    for trial in range(250):
+        ni = rng.randint(1, 6)
+        nm = rng.randint(1, 18)
+        ids = ["m%02d" % i for i in range(nm)]
+        gates_roots = []
+        leaf_masks = []  # [instance][material]
+        tuples = []
+        for _k in range(ni):
+            nleaves = rng.randint(1, 4)
+            t = make_formula(rng.randint(1, 3), nleaves)
+            gates_out = []
+            root = flatten(t, nleaves, gates_out)
+            gates = [("l", i) for i in range(nleaves)] + gates_out
+            gates_roots.append((gates, root, nleaves))
+            tuples.append(t)
+            leaf_masks.append([rng.randrange(0, 1 << nleaves)
+                               for _j in range(nm)])
+        cov_e, sel_e = solve_exhaustive(gates_roots, ids, leaf_masks)
+        cov_b, sel_b = solve_branch_bound(gates_roots, ids, leaf_masks)
+        got_e = (bin(cov_e).count("1"), sel_e)
+        got_b = (bin(cov_b).count("1"), sel_b)
+        if got_e != got_b:
+            mismatches += 1
+            if mismatches <= 5:
+                print("  solver mismatch trial", trial,
+                      "exhaustive", got_e, "bnb", got_b)
+            continue
+        # brute-force oracle only where enumeration is cheap (<=12 mats)
+        if nm > 12:
+            continue
+        oracle_key, oracle_cov = None, 0
+        for r in range(nm + 1):
+            for combo in itertools.combinations(range(nm), r):
+                cov = 0
+                for k, t in enumerate(tuples):
+                    truth = 0
+                    for j in combo:
+                        truth |= leaf_masks[k][j]
+                    if eval_tuple(t, truth):
+                        cov |= 1 << k
+                key = (-bin(cov).count("1"), r, tuple(ids[j] for j in combo))
+                if oracle_key is None or key < oracle_key:
+                    oracle_key, oracle_cov = key, cov
+        want = (bin(oracle_cov).count("1"), oracle_key[2])
+        if got_e != want:
+            mismatches += 1
+            if mismatches <= 5:
+                print("  oracle mismatch trial", trial, got_e, "oracle", want)
+    check("fulfillment fuzz: branch-and-bound == exhaustive == brute force",
+          mismatches == 0, "%d mismatches" % mismatches)
+
+    # -- end-to-end fuzz with random nested all/any rules ------------------
+    bad = 0
+    types = ["t0", "t1", "t2"]
+
+    def random_rule(depth, comps):
+        if depth <= 0 or rng.random() < 0.35:
+            leaf = {}
+            if rng.random() < 0.7:
+                leaf["type"] = rng.choice(types)
+            if rng.random() < 0.6:
+                leaf["scope"] = rng.choice(["product", "component"])
+            if not leaf:
+                leaf["type"] = rng.choice(types)
+            if rng.random() < 0.25:
+                leaf["component"] = rng.choice(comps)
+            return leaf
+        comb = "all" if rng.random() < 0.5 else "any"
+        return {comb: [random_rule(depth - 1, comps)
+                       for _ in range(rng.randint(2, 3))]}
+
+    def oracle_node(node, materials, inst):
+        if "all" in node:
+            return all(oracle_node(ch, materials, inst) for ch in node["all"])
+        if "any" in node:
+            return any(oracle_node(ch, materials, inst) for ch in node["any"])
+        for m in materials:
+            if "type" in node and node["type"] != m["type"]:
+                continue
+            if "scope" in node and node["scope"] != m["scope"]:
+                continue
+            if m["scope"] == "component" and m["component"] != inst[0]:
+                continue
+            if "component" in node and node["component"] != inst[0]:
+                continue
+            return True
+        return False
+
+    for trial in range(120):
+        comps = ["c%d" % i for i in range(rng.randint(1, 4))]
+        obs = ["o%d" % i for i in range(rng.randint(1, 4))]
+        result = {"status": "ok", "components": [
+            {"id": c, "obligations": obs[:rng.randint(0, len(obs))]} for c in comps]}
+        instances = [(c["id"], o) for c in result["components"]
+                     for o in c["obligations"]]
+        nm = rng.randint(1, 12)
+        materials = []
+        used_digests = set()
+        for i in range(nm):
+            digest = "dig%02d" % i
+            used_digests.add(digest)
+            m = {"id": "m%02d" % i, "digest": digest,
+                 "type": rng.choice(types),
+                 "scope": rng.choice(["product", "component"])}
+            if m["scope"] == "component":
+                m["component"] = rng.choice(comps)
+            materials.append(m)
+        rules = {"obligations": {o: random_rule(3, comps) for o in obs}}
+        out = check_fulfillment({"materials": materials, "rules": rules}, result)
+
+        ids = [m["id"] for m in materials]
+        by_id = {m["id"]: m for m in materials}
+        oracle_best = None
+        for r in range(len(ids) + 1):
+            for combo in itertools.combinations(ids, r):
+                sel_mats = [by_id[x] for x in combo]
+                hit = sum(
+                    1 for inst in instances
+                    if oracle_node(rules["obligations"][inst[1]],
+                                   sel_mats, inst)
+                )
+                key = (-hit, len(combo), tuple(sorted(combo)))
+                if oracle_best is None or key < oracle_best[0]:
+                    oracle_best = (key, hit)
+        got = (-out["instances_satisfied"], len(out["selected_materials"]),
+               tuple(out["selected_materials"]))
+        if got != oracle_best[0]:
+            bad += 1
+            if bad <= 3:
+                print("  e2e mismatch trial", trial, got, oracle_best[0])
+        # determinism + order invariance (materials and rule arrays)
+        shuffled_rules = {"obligations": dict(rules["obligations"])}
+
+        def shuffle_node(node):
+            for key in ("all", "any"):
+                if key in node:
+                    rng.shuffle(node[key])
+                    for ch in node[key]:
+                        shuffle_node(ch)
+
+        for node in shuffled_rules["obligations"].values():
+            shuffle_node(node)
+        body2 = {"materials": list(reversed(materials)),
+                 "rules": shuffled_rules}
+        out2 = check_fulfillment(body2, result)
+        if out2["fulfillment_hash"] != out["fulfillment_hash"]:
+            bad += 1
+        if out["ready"] != (out["instances_satisfied"] == len(instances)):
+            bad += 1
+        # every reported gap must really be unsatisfiable by the full set
+        for g in out["gaps"]:
+            inst = (g["component"], g["obligation"])
+            node = rules["obligations"].get(inst[1])
+            if node is not None and oracle_node(node, materials, inst):
+                bad += 1
+                break
+        # every satisfied instance must indeed be satisfied
+        for s in out["satisfied"]:
+            inst = (s["component"], s["obligation"])
+            node = rules["obligations"].get(inst[1])
+            sel_mats = [by_id[x] for x in out["selected_materials"]]
+            if not oracle_node(node, sel_mats, inst):
+                bad += 1
+                break
+    check("fulfillment fuzz: global optimum, gaps and order invariance",
+          bad == 0, "%d mismatches" % bad)
+
+
+def run_schedule_checks(call, check, conflict_aid):
+    """End-to-end checks for POST /v1/assessments/{id}/obligation-schedule."""
+    # an assessment whose license carries three custom obligations so the
+    # schedule is self-contained (independent of default ruleset vocabulary)
+    sch_request = {
+        "product": "sched-product",
+        "components": [
+            {"id": "a", "license": "SCH-1.0"},
+            {"id": "b", "license": "SCH-1.0"},
+        ],
+        "rules": {"licenses": {"SCH-1.0": {"obligations": ["alpha", "beta", "gamma"]}}},
+    }
+    code, body = call("POST", "/v1/assessments", sch_request)
+    sch_aid = body.get("id")
+    check("schedule: fixture assessment ok",
+          code == 200 and body.get("result", {}).get("status") == "ok",
+          json.dumps(body)[:200])
+
+    # 2026-09-25 is a Friday; 2026-10-01/02 are holidays, so 5 business days
+    # after it is 2026-10-06 (Sep 28/29/30, Oct 5/6)
+    sched_body = {
+        "release_at": "2026-09-25T16:00:00+08:00",
+        "timezone": "Asia/Shanghai",
+        "workdays": [1, 2, 3, 4, 5],
+        "holidays": ["2026-10-01", "2026-10-02"],
+        "obligations": {
+            "alpha": {"offset": 5, "unit": "business_day", "depends_on": []},
+            "beta": {"offset": 20, "unit": "calendar_day", "depends_on": ["alpha"]},
+            "gamma": {"offset": 10, "unit": "calendar_day", "depends_on": ["beta"]},
+        },
+    }
+    code, out = call("POST", "/v1/assessments/%s/obligation-schedule" % sch_aid,
+                     sched_body)
+    items = {i["obligation"]: i for i in out.get("schedule", [])}
+    check("schedule: 200 with every obligation scheduled",
+          code == 200 and sorted(items) == ["alpha", "beta", "gamma"],
+          json.dumps(out)[:200])
+    check("schedule: business-day raw deadline skips weekends and holidays",
+          items.get("alpha", {}).get("raw_deadline") == "2026-10-06",
+          str(items.get("alpha")))
+    check("schedule: calendar-day raw deadlines",
+          items.get("beta", {}).get("raw_deadline") == "2026-10-15"
+          and items.get("gamma", {}).get("raw_deadline") == "2026-10-05")
+    check("schedule: prerequisites tightened to not exceed successors",
+          items.get("alpha", {}).get("deadline") == "2026-10-05"
+          and items.get("beta", {}).get("deadline") == "2026-10-05"
+          and items.get("gamma", {}).get("deadline") == "2026-10-05")
+    check("schedule: complete tightening chains reported",
+          items.get("alpha", {}).get("tightening_chain") == ["alpha", "beta", "gamma"]
+          and items.get("beta", {}).get("tightening_chain") == ["beta", "gamma"]
+          and items.get("gamma", {}).get("tightening_chain") == []
+          and items.get("alpha", {}).get("tightened") is True
+          and items.get("gamma", {}).get("tightened") is False)
+    check("schedule: covered components listed",
+          items.get("alpha", {}).get("components") == ["a", "b"])
+    check("schedule: release moment normalized and localized",
+          out.get("release_at") == "2026-09-25T08:00:00Z"
+          and out.get("release_date") == "2026-09-25")
+    sched_hash = out.get("schedule_hash")
+
+    # input ordering (object keys, workdays, holidays, depends_on) is irrelevant
+    permuted = {
+        "obligations": {
+            "gamma": {"depends_on": ["beta"], "unit": "calendar_day", "offset": 10},
+            "beta": {"depends_on": ["alpha"], "unit": "calendar_day", "offset": 20},
+            "alpha": {"depends_on": [], "unit": "business_day", "offset": 5},
+        },
+        "holidays": ["2026-10-02", "2026-10-01"],
+        "workdays": [5, 4, 3, 2, 1],
+        "timezone": "Asia/Shanghai",
+        "release_at": "2026-09-25T16:00:00+08:00",
+    }
+    code, out2 = call("POST", "/v1/assessments/%s/obligation-schedule" % sch_aid,
+                       permuted)
+    check("schedule: input order does not change schedule_hash",
+          code == 200 and out2.get("schedule_hash") == sched_hash)
+
+    # the same instant in another notation lands on the same schedule
+    code, out2 = call("POST", "/v1/assessments/%s/obligation-schedule" % sch_aid,
+                      dict(sched_body, release_at="2026-09-25T08:00:00Z"))
+    check("schedule: equivalent instant normalized to same hash",
+          code == 200 and out2.get("schedule_hash") == sched_hash)
+
+    # the release moment is converted into the target timezone before dating
+    code, out2 = call("POST", "/v1/assessments/%s/obligation-schedule" % sch_aid,
+                      dict(sched_body, release_at="2026-09-25T23:30:00-04:00"))
+    check("schedule: release moment converted to local timezone",
+          code == 200 and out2.get("release_date") == "2026-09-26")
+
+    # extra milestone obligations join the graph with empty component coverage
+    milestone_body = dict(sched_body)
+    milestone_body["obligations"] = dict(
+        sched_body["obligations"],
+        **{"legal-review": {"offset": 3, "unit": "business_day",
+                            "depends_on": ["gamma"]}}
+    )
+    code, out2 = call("POST", "/v1/assessments/%s/obligation-schedule" % sch_aid,
+                      milestone_body)
+    m_items = {i["obligation"]: i for i in out2.get("schedule", [])}
+    check("schedule: milestone obligation scheduled with empty coverage",
+          code == 200
+          and m_items.get("legal-review", {}).get("components") == []
+          and m_items.get("legal-review", {}).get("raw_deadline") == "2026-09-30"
+          and m_items.get("gamma", {}).get("deadline") == "2026-09-30"
+          and m_items.get("gamma", {}).get("tightening_chain")
+          == ["gamma", "legal-review"],
+          json.dumps(out2)[:300] if code == 200 else str(out2))
+
+    # -- 422: semantic failures never produce a partial schedule ------------
+    def mutated(mutate):
+        body = json.loads(json.dumps(sched_body))
+        mutate(body)
+        return body
+
+    def make_cycle(b):
+        b["obligations"]["alpha"]["depends_on"] = ["gamma"]
+        b["obligations"]["gamma"]["depends_on"] = ["alpha"]
+
+    cases_422 = [
+        ("missing obligation rule", mutated(lambda b: b["obligations"].pop("gamma"))),
+        ("unknown timezone", mutated(lambda b: b.update(timezone="Mars/Olympus"))),
+        ("invalid release_at",
+         mutated(lambda b: b.update(release_at="2026-02-30T10:00:00Z"))),
+        ("release_at without offset",
+         mutated(lambda b: b.update(release_at="2026-09-25T16:00:00"))),
+        ("invalid holiday", mutated(lambda b: b.update(holidays=["2026-13-01"]))),
+        ("dependency cycle", mutated(make_cycle)),
+        ("self dependency",
+         mutated(lambda b: b["obligations"]["alpha"].update(depends_on=["alpha"]))),
+        ("dangling depends_on",
+         mutated(lambda b: b["obligations"]["alpha"].update(depends_on=["ghost"]))),
+    ]
+    for label, bad in cases_422:
+        code, out = call("POST", "/v1/assessments/%s/obligation-schedule" % sch_aid,
+                         bad)
+        check("schedule: 422 on %s" % label,
+              code == 422 and "schedule" not in out and "schedule_hash" not in out,
+              "%s -> %s" % (code, json.dumps(out)[:120]))
+
+    # -- 400: malformed payloads --------------------------------------------
+    cases_400 = [
+        ("unknown unit",
+         mutated(lambda b: b["obligations"]["alpha"].update(unit="hour"))),
+        ("negative offset",
+         mutated(lambda b: b["obligations"]["alpha"].update(offset=-1))),
+        ("missing workdays", mutated(lambda b: b.pop("workdays"))),
+        ("weekday out of range", mutated(lambda b: b.update(workdays=[1, 8]))),
+    ]
+    for label, bad in cases_400:
+        code, out = call("POST", "/v1/assessments/%s/obligation-schedule" % sch_aid,
+                         bad)
+        check("schedule: 400 on %s" % label, code == 400, str(out)[:100])
+
+    # -- non-ok assessment -> 409; unknown assessment -> 404 -----------------
+    code, out = call("POST", "/v1/assessments/%s/obligation-schedule" % conflict_aid,
+                     sched_body)
+    check("schedule: non-ok assessment -> 409", code == 409, str(out)[:120])
+    code, out = call("POST", "/v1/assessments/%s/obligation-schedule" % ("f" * 32),
+                     sched_body)
+    check("schedule: unknown assessment -> 404", code == 404)
+
+    # an assessment without artifact obligations yields an empty schedule
+    code, body = call("POST", "/v1/assessments",
+                      {"components": [{"id": "solo", "license": "Unlicense"}]})
+    empty_aid = body.get("id")
+    code, out = call("POST", "/v1/assessments/%s/obligation-schedule" % empty_aid,
+                     {"release_at": "2026-09-25T16:00:00+08:00",
+                      "timezone": "UTC", "workdays": [1, 2, 3, 4, 5]})
+    check("schedule: no artifact obligations -> empty schedule",
+          code == 200 and out.get("schedule") == [] and bool(out.get("schedule_hash")),
+          json.dumps(out)[:200])
+
+
+def run_plan_checks(call, check, conflict_aid):
+    """End-to-end checks for POST /v1/assessments/{id}/responsibility-plan."""
+    # fixture: two components x two obligations -> six responsibility items
+    # (artifact:alpha, artifact:beta plus one per component)
+    rp_request = {
+        "product": "rp-product",
+        "components": [
+            {"id": "a", "license": "RP-1.0"},
+            {"id": "b", "license": "RP-1.0"},
+        ],
+        "rules": {"licenses": {"RP-1.0": {"obligations": ["alpha", "beta"]}}},
+    }
+    code, body = call("POST", "/v1/assessments", rp_request)
+    rp_aid = body.get("id")
+    check("plan: fixture assessment ok",
+          code == 200 and body.get("result", {}).get("status") == "ok",
+          json.dumps(body)[:200])
+
+    # cost structure forces a specific global optimum: bob (cheapest
+    # executor) takes four executes, alice two executes + two reviews,
+    # carol (cheapest reviewer) four reviews; the (item, executor,
+    # reviewer) tie-break fixes exactly which items each person staffs
+    people = [
+        {"id": "alice",
+         "qualifications": {"execute": ["alpha", "beta"], "review": ["alpha"]},
+         "capacity": 4, "costs": {"execute": 4, "review": 2}},
+        {"id": "bob",
+         "qualifications": {"execute": ["alpha", "beta"],
+                            "review": ["alpha", "beta"]},
+         "capacity": 4, "costs": {"execute": 3, "review": 3}},
+        {"id": "carol",
+         "qualifications": {"review": ["alpha", "beta"]},
+         "capacity": 4, "costs": {"review": 1}},
+    ]
+    code, out = call("POST", "/v1/assessments/%s/responsibility-plan" % rp_aid,
+                     {"people": people})
+    check("plan: 200 and every item staffed",
+          code == 200 and out.get("ready") is True
+          and out.get("items_total") == 6 and out.get("items_assigned") == 6,
+          json.dumps(out)[:200])
+    check("plan: global optimum with item/executor/reviewer tie-break",
+          [(a["item"], a["executor"], a["reviewer"], a["cost"])
+           for a in out.get("assignments", [])]
+          == [("artifact:alpha", "alice", "carol", 5),
+              ("artifact:beta", "alice", "carol", 5),
+              ("component:a:alpha", "bob", "alice", 5),
+              ("component:a:beta", "bob", "carol", 4),
+              ("component:b:alpha", "bob", "alice", 5),
+              ("component:b:beta", "bob", "carol", 4)],
+          json.dumps(out.get("assignments"))[:300])
+    check("plan: total cost minimized", out.get("total_cost") == 28,
+          str(out.get("total_cost")))
+    check("plan: capacity usage per person",
+          [(u["person"], u["execute"], u["review"], u["used"], u["capacity"])
+           for u in out.get("capacity_usage", [])]
+          == [("alice", 2, 2, 4, 4),
+              ("bob", 4, 0, 4, 4),
+              ("carol", 0, 4, 4, 4)])
+    check("plan: exhaustive selection mode",
+          out.get("selection_mode") == "exhaustive")
+    rp_hash = out.get("plan_hash")
+
+    # people order and qualification order (and duplicates) are irrelevant
+    shuffled = {"people": [
+        {"id": "carol", "capacity": 4, "costs": {"review": 1},
+         "qualifications": {"review": ["beta", "alpha", "alpha"]}},
+        {"id": "bob", "capacity": 4,
+         "costs": {"review": 3, "execute": 3},
+         "qualifications": {"execute": ["beta", "alpha"],
+                            "review": ["beta", "alpha"]}},
+        {"id": "alice", "capacity": 4,
+         "costs": {"review": 2, "execute": 4},
+         "qualifications": {"execute": ["beta", "alpha"], "review": ["alpha"]}},
+    ]}
+    code, out2 = call("POST", "/v1/assessments/%s/responsibility-plan" % rp_aid,
+                      shuffled)
+    check("plan: people/qualification order does not change result",
+          code == 200 and out2.get("plan_hash") == rp_hash
+          and out2.get("assignments") == out.get("assignments"))
+
+    # trap fixture: one component, one obligation -> two items
+    trap_request = {
+        "components": [{"id": "c", "license": "RPX-1.0"}],
+        "rules": {"licenses": {"RPX-1.0": {"obligations": ["x"]}}},
+    }
+    code, body = call("POST", "/v1/assessments", trap_request)
+    trap_aid = body.get("id")
+    check("plan: trap fixture assessment ok",
+          code == 200 and body.get("result", {}).get("status") == "ok")
+
+    # executor-first greedy trap: the cheapest executor (alice, cost 1)
+    # would take both executes, exhausting her capacity so only carol's
+    # single review remains -> one item staffed.  The global optimum lets
+    # bob execute both items and alice review both: two items, cost 12.
+    trap_people = [
+        {"id": "alice", "qualifications": {"execute": ["x"], "review": ["x"]},
+         "capacity": 2, "costs": {"execute": 1, "review": 1}},
+        {"id": "bob", "qualifications": {"execute": ["x"]},
+         "capacity": 2, "costs": {"execute": 5}},
+        {"id": "carol", "qualifications": {"review": ["x"]},
+         "capacity": 1, "costs": {"review": 10}},
+    ]
+    code, out = call("POST", "/v1/assessments/%s/responsibility-plan" % trap_aid,
+                     {"people": trap_people})
+    check("plan: global optimum beats executor-first greedy",
+          code == 200 and out.get("ready") is True
+          and out.get("items_assigned") == 2
+          and out.get("total_cost") == 12
+          and [(a["item"], a["executor"], a["reviewer"])
+               for a in out.get("assignments", [])]
+          == [("artifact:x", "bob", "alice"),
+              ("component:c:x", "bob", "alice")],
+          json.dumps(out)[:300])
+
+    # cost minimization beats the lexicographically smaller assignment:
+    # amy is the smaller executor id but zoe is cheaper, so zoe staffs both
+    cost_first = [
+        {"id": "amy", "qualifications": {"execute": ["x"]},
+         "capacity": 2, "costs": {"execute": 5}},
+        {"id": "zoe", "qualifications": {"execute": ["x"]},
+         "capacity": 2, "costs": {"execute": 1}},
+        {"id": "bob", "qualifications": {"review": ["x"]},
+         "capacity": 2, "costs": {"review": 0}},
+    ]
+    code, out = call("POST", "/v1/assessments/%s/responsibility-plan" % trap_aid,
+                     {"people": cost_first})
+    check("plan: cost minimization beats lexicographic order",
+          code == 200
+          and [(a["item"], a["executor"], a["reviewer"])
+               for a in out.get("assignments", [])]
+          == [("artifact:x", "zoe", "bob"), ("component:c:x", "zoe", "bob")]
+          and out.get("total_cost") == 2)
+
+    # equal costs: the (item, executor, reviewer) sequence breaks the tie
+    tie_people = [
+        {"id": "zoe", "qualifications": {"execute": ["x"], "review": ["x"]},
+         "capacity": 2},
+        {"id": "amy", "qualifications": {"execute": ["x"], "review": ["x"]},
+         "capacity": 2},
+    ]
+    code, out = call("POST", "/v1/assessments/%s/responsibility-plan" % trap_aid,
+                     {"people": tie_people})
+    check("plan: lexicographic tie-break at equal cost",
+          code == 200
+          and [(a["item"], a["executor"], a["reviewer"])
+               for a in out.get("assignments", [])]
+          == [("artifact:x", "amy", "zoe"), ("component:c:x", "amy", "zoe")]
+          and out.get("total_cost") == 0)
+
+    # fractional costs are exact: 0.1 + 0.2 style inputs never disturb the
+    # optimization; the total is reported as a JSON number
+    frac_people = [
+        {"id": "alice", "qualifications": {"execute": ["x"]},
+         "capacity": 2, "costs": {"execute": 0.1}},
+        {"id": "bob", "qualifications": {"review": ["x"]},
+         "capacity": 2, "costs": {"review": 0.2}},
+    ]
+    code, out = call("POST", "/v1/assessments/%s/responsibility-plan" % trap_aid,
+                     {"people": frac_people})
+    check("plan: fractional costs stay exact",
+          code == 200 and out.get("ready") is True
+          and out.get("total_cost") == 2 * 0.1 + 2 * 0.2)
+
+    # -- 409: best partial plan plus per-item blockage reasons --------------
+    def plan409(persons):
+        return call("POST", "/v1/assessments/%s/responsibility-plan" % trap_aid,
+                    {"people": persons})
+
+    code, out = plan409([{"id": "carol", "capacity": 5,
+                          "qualifications": {"review": ["x"]}}])
+    check("plan: 409 with best partial plan when uncoverable",
+          code == 409 and out.get("ready") is False
+          and out.get("items_assigned") == 0
+          and out.get("assignments") == []
+          and bool(out.get("error")) and bool(out.get("plan_hash")))
+    check("plan: no-qualified-executor reason",
+          [(u["item"], u["reason"], u["qualified_executors"],
+            u["qualified_reviewers"]) for u in out.get("unassigned", [])]
+          == [("artifact:x", "no-qualified-executor", [], ["carol"]),
+              ("component:c:x", "no-qualified-executor", [], ["carol"])])
+
+    code, out = plan409([{"id": "bob", "capacity": 5,
+                          "qualifications": {"execute": ["x"]}}])
+    check("plan: no-qualified-reviewer reason",
+          code == 409
+          and [u["reason"] for u in out.get("unassigned", [])]
+          == ["no-qualified-reviewer"] * 2)
+
+    code, out = plan409([{"id": "alice", "capacity": 5,
+                          "qualifications": {"execute": ["x"], "review": ["x"]}}])
+    check("plan: no-distinct-pair reason",
+          code == 409
+          and [u["reason"] for u in out.get("unassigned", [])]
+          == ["no-distinct-pair"] * 2)
+
+    code, out = plan409([
+        {"id": "alice", "capacity": 1, "costs": {"execute": 1},
+         "qualifications": {"execute": ["x"]}},
+        {"id": "bob", "capacity": 1, "costs": {"review": 1},
+         "qualifications": {"review": ["x"]}},
+    ])
+    check("plan: insufficient-capacity reason with best partial plan",
+          code == 409 and out.get("items_assigned") == 1
+          and [(a["item"], a["executor"], a["reviewer"])
+               for a in out.get("assignments", [])]
+          == [("artifact:x", "alice", "bob")]
+          and [(u["item"], u["reason"]) for u in out.get("unassigned", [])]
+          == [("component:c:x", "insufficient-capacity")],
+          json.dumps(out)[:300])
+
+    # -- 400: malformed payloads ---------------------------------------------
+    cases_400 = [
+        ("people not an array", {"people": {}}),
+        ("duplicate person id", {"people": [
+            {"id": "a", "capacity": 1}, {"id": "a", "capacity": 1}]}),
+        ("negative capacity", {"people": [{"id": "a", "capacity": -1}]}),
+        ("boolean capacity", {"people": [{"id": "a", "capacity": True}]}),
+        ("negative cost", {"people": [
+            {"id": "a", "capacity": 1, "costs": {"execute": -2}}]}),
+        ("unknown person field", {"people": [
+            {"id": "a", "capacity": 1, "team": "x"}]}),
+        ("qualifications not arrays", {"people": [
+            {"id": "a", "capacity": 1, "qualifications": {"execute": "x"}}]}),
+        ("non-string qualification", {"people": [
+            {"id": "a", "capacity": 1, "qualifications": {"execute": [1]}}]}),
+        ("body not an object", [1, 2, 3]),
+    ]
+    for label, bad in cases_400:
+        code, out = call("POST", "/v1/assessments/%s/responsibility-plan" % trap_aid,
+                         bad)
+        check("plan: 400 on %s" % label, code == 400, str(out)[:100])
+
+    # -- non-ok assessment -> 409; unknown assessment -> 404 ------------------
+    code, out = call("POST", "/v1/assessments/%s/responsibility-plan" % conflict_aid,
+                     {"people": []})
+    check("plan: non-ok assessment -> 409", code == 409, str(out)[:120])
+    code, out = call("POST", "/v1/assessments/%s/responsibility-plan" % ("f" * 32),
+                     {"people": []})
+    check("plan: unknown assessment -> 404", code == 404)
+
+    # an assessment without obligations yields an empty, ready plan
+    code, body = call("POST", "/v1/assessments",
+                      {"components": [{"id": "solo", "license": "Unlicense"}]})
+    empty_aid = body.get("id")
+    code, out = call("POST", "/v1/assessments/%s/responsibility-plan" % empty_aid,
+                     {"people": []})
+    check("plan: no obligations -> empty ready plan",
+          code == 200 and out.get("ready") is True
+          and out.get("items_total") == 0 and out.get("assignments") == []
+          and out.get("unassigned") == [] and out.get("total_cost") == 0
+          and bool(out.get("plan_hash")), json.dumps(out)[:200])
+
+    # -- solver equivalence through the full pipeline -------------------------
+    from app import responsibility
+
+    def direct_plan(aid, plan_body, cap):
+        old = responsibility.MAX_PLAN_COMBINATIONS
+        responsibility.MAX_PLAN_COMBINATIONS = cap
+        try:
+            _code, res = call("GET", "/v1/assessments/%s" % aid)
+            try:
+                return responsibility.build_plan(plan_body, res["result"], aid)
+            except responsibility.PartialPlanError as exc:
+                return exc.payload
+        finally:
+            responsibility.MAX_PLAN_COMBINATIONS = old
+
+    def stripped(plan):
+        return {k: v for k, v in plan.items()
+                if k not in ("selection_mode", "plan_hash")}
+
+    # four fully-qualified people on the six-item fixture: 13^6 combinations,
+    # so the default cap routes it to branch-and-bound
+    big_people = [
+        {"id": "p%d" % i,
+         "qualifications": {"execute": ["alpha", "beta"],
+                            "review": ["alpha", "beta"]},
+         "capacity": 4,
+         "costs": {"execute": 2 + i, "review": 1 + (i % 3)}}
+        for i in range(4)
+    ]
+    battery = [
+        (rp_aid, {"people": people}),
+        (rp_aid, {"people": big_people}),
+        (trap_aid, {"people": trap_people}),
+        (trap_aid, {"people": tie_people}),
+        (trap_aid, {"people": [
+            {"id": "alice", "capacity": 1, "costs": {"execute": 1},
+             "qualifications": {"execute": ["x"]}},
+            {"id": "bob", "capacity": 1, "costs": {"review": 1},
+             "qualifications": {"review": ["x"]}},
+        ]}),
+    ]
+    for i, (aid, plan_body) in enumerate(battery):
+        check("plan: branch-and-bound matches exhaustive #%d" % (i + 1),
+              stripped(direct_plan(aid, plan_body, 0))
+              == stripped(direct_plan(aid, plan_body, 10**9)))
+
+    # the big case really does take the branch-and-bound path by default,
+    # and its HTTP result equals the forced-exhaustive result
+    code, out = call("POST", "/v1/assessments/%s/responsibility-plan" % rp_aid,
+                     {"people": big_people})
+    check("plan: large choice space uses branch-and-bound",
+          code == 200 and out.get("selection_mode") == "branch-and-bound"
+          and out.get("ready") is True and out.get("items_assigned") == 6)
+    check("plan: branch-and-bound HTTP result matches forced exhaustive",
+          code == 200
+          and stripped(out) == stripped(direct_plan(rp_aid, {"people": big_people},
+                                                    10**9)))
+
+    # randomized end-to-end equivalence (deterministic seed)
+    import random as _rnd
+    rng = _rnd.Random(20260927)
+    mismatches = 0
+    for _trial in range(25):
+        persons = []
+        for pi in range(rng.randint(1, 3)):
+            quals = {}
+            if rng.random() < 0.8:
+                quals["execute"] = [ob for ob in ("alpha", "beta")
+                                    if rng.random() < 0.7]
+            if rng.random() < 0.8:
+                quals["review"] = [ob for ob in ("alpha", "beta")
+                                   if rng.random() < 0.7]
+            persons.append({
+                "id": "p%d" % pi,
+                "qualifications": quals,
+                "capacity": rng.randint(0, 4),
+                "costs": {"execute": rng.randint(0, 6),
+                          "review": rng.randint(0, 6)},
+            })
+        plan_body = {"people": persons}
+        if stripped(direct_plan(rp_aid, plan_body, 0)) != stripped(
+            direct_plan(rp_aid, plan_body, 10**9)
+        ):
+            mismatches += 1
+    check("plan: randomized branch-and-bound/exhaustive equivalence",
+          mismatches == 0, "%d mismatches" % mismatches)
+
+
+def run_plan_fuzz(check):
+    """Randomized exactness checks for the responsibility-plan optimizer."""
+    import itertools
+    import random
+    from fractions import Fraction
+
+    from app.responsibility import solve_branch_bound, solve_exhaustive
+
+    rng = random.Random(20260927)
+    mismatches = 0
+    for trial in range(150):
+        n = rng.randint(1, 5)
+        p = rng.randint(1, 4)
+        item_ids = ["i%d" % i for i in range(n)]
+        person_ids = ["p%d" % i for i in range(p)]
+        capacities = [rng.randint(0, 3) for _ in range(p)]
+        exec_costs = [Fraction(rng.randint(0, 5)) for _ in range(p)]
+        rev_costs = [Fraction(rng.randint(0, 5)) for _ in range(p)]
+        candidates = []
+        for _ in range(n):
+            pairs = []
+            for e in range(p):
+                for r in range(p):
+                    if e != r and rng.random() < 0.6:
+                        pairs.append((e, r, exec_costs[e] + rev_costs[r]))
+            pairs.sort(key=lambda t: (t[0], t[1]))
+            candidates.append(tuple(pairs))
+        role_costs = (exec_costs, rev_costs)
+        got_e = solve_exhaustive(
+            item_ids, candidates, capacities, person_ids, role_costs
+        )
+        got_b = solve_branch_bound(
+            item_ids, candidates, capacities, person_ids, role_costs
+        )
+        # brute-force oracle over every per-item choice combination
+        best = None
+        best_assign = None
+        choices = [[None] + list(c) for c in candidates]
+        for combo in itertools.product(*choices):
+            used = [0] * p
+            feasible = True
+            for pick in combo:
+                if pick is None:
+                    continue
+                e, r, _c = pick
+                used[e] += 1
+                used[r] += 1
+                if used[e] > capacities[e] or used[r] > capacities[r]:
+                    feasible = False
+                    break
+            if not feasible:
+                continue
+            count = sum(1 for pick in combo if pick is not None)
+            cost = sum((pick[2] for pick in combo if pick is not None),
+                       Fraction(0))
+            seq = tuple(
+                (item_ids[j], person_ids[pick[0]], person_ids[pick[1]])
+                for j, pick in enumerate(combo) if pick is not None
+            )
+            key = (-count, cost, seq)
+            if best is None or key < best:
+                best = key
+                best_assign = [
+                    None if pick is None else (pick[0], pick[1]) for pick in combo
+                ]
+        if got_e != (best, best_assign) or got_b != (best, best_assign):
+            mismatches += 1
+            if mismatches <= 5:
+                print("  plan solver mismatch trial", trial,
+                      "oracle", best, "exhaustive", got_e[0], "bnb", got_b[0])
+    check("plan fuzz: branch-and-bound == exhaustive == brute force",
+          mismatches == 0, "%d mismatches" % mismatches)
+
+
+def run_remediation_checks(call, check):
+    """End-to-end checks for POST /v1/assessments/{id}/remediation-plan."""
+    # Fixture: an unavoidable GPL-2.0-only / Apache-2.0 incompatibility
+    # (both statically linked into app); docs is an unrelated component.
+    req = {
+        "product": "clash",
+        "components": [
+            {"id": "app", "name": "App", "version": "1", "license": "MIT"},
+            {"id": "libg", "name": "G", "version": "2",
+             "license": "GPL-2.0-only", "linkage": "static"},
+            {"id": "libap", "name": "A", "version": "3",
+             "license": "Apache-2.0", "linkage": "static"},
+            {"id": "docs", "license": "CC0-1.0"},
+        ],
+        "dependencies": [
+            {"from": "app", "to": "libg"},
+            {"from": "app", "to": "libap"},
+        ],
+    }
+    code, body = call("POST", "/v1/assessments", req)
+    aid = body.get("id")
+    check("remediation: fixture conflicts",
+          code == 200 and body["result"]["status"] == "conflict")
+
+    # -- releasable optimum: cheapest fix, global not per-component ----------
+    plan_body = {"components": {
+        "libap": [
+            {"id": "mit", "expression": "MIT", "cost": 5},
+            {"id": "isc", "expression": "ISC", "cost": 8},
+        ],
+        "libg": [{"id": "mit", "expression": "MIT", "cost": 10}],
+    }}
+    code, body = call("POST", "/v1/assessments/%s/remediation-plan" % aid, plan_body)
+    check("remediation: releasable 200", code == 200, str(body)[:200])
+    check("remediation: release true", body.get("release") is True)
+    check("remediation: cheapest global fix",
+          body.get("total_cost") == 5 and body.get("changed_components") == 1,
+          str((body.get("total_cost"), body.get("changed_components"))))
+    check("remediation: replacement list",
+          [(r["component"], r["candidate_id"]) for r in body.get("replacements", [])]
+          == [("libap", "mit")])
+    sel = {(s["component"]): s for s in body.get("selection", [])}
+    check("remediation: every component appears in selection",
+          sorted(sel) == ["app", "docs", "libap", "libg"])
+    check("remediation: kept components are zero-cost keep",
+          sel["libg"]["candidate_id"] == "keep" and sel["libg"]["cost"] == 0
+          and sel["libg"]["changed"] is False
+          and sel["app"]["candidate_id"] == "keep")
+    check("remediation: recomputed release conclusion",
+          body.get("reassessed", {}).get("status") == "ok"
+          and body.get("reassessed", {}).get("release") is True
+          and body.get("adopted", {}).get("libap") == "MIT"
+          and "attribution" in body.get("artifact_obligations", []))
+    check("remediation: from_expression preserved",
+          body["replacements"][0]["from_expression"] == "Apache-2.0")
+    check("remediation: hash present",
+          isinstance(body.get("remediation_hash"), str)
+          and len(body["remediation_hash"]) == 64)
+    h1 = body["remediation_hash"]
+
+    # -- order independence: shuffle components and candidates --------------
+    shuffled = {"components": {
+        "libg": [{"id": "mit", "expression": "MIT", "cost": 10}],
+        "libap": [
+            {"id": "isc", "expression": "ISC", "cost": 8},
+            {"id": "mit", "expression": "MIT", "cost": 5},
+        ],
+    }}
+    code, body2 = call("POST", "/v1/assessments/%s/remediation-plan" % aid, shuffled)
+    check("remediation: order independent",
+          code == 200 and body2.get("remediation_hash") == h1
+          and [(r["component"], r["candidate_id"]) for r in body2["replacements"]]
+          == [("libap", "mit")])
+
+    # -- tie-break: equal cost -> fewer changes; equal changes -> lexicographic
+    tie_body = {"components": {
+        "libap": [
+            {"id": "a-mit", "expression": "MIT", "cost": 5},
+            {"id": "a-isc", "expression": "ISC", "cost": 5},
+        ],
+        "libg": [{"id": "g-mit", "expression": "MIT", "cost": 5}],
+    }}
+    code, body = call("POST", "/v1/assessments/%s/remediation-plan" % aid, tie_body)
+    # any single change releases at cost 5; component-id tie-break picks
+    # libap before libg, then candidate-id tie-break picks a-isc
+    check("remediation: tie resolves uniquely",
+          code == 200 and body.get("changed_components") == 1
+          and body["replacements"][0]["component"] == "libap"
+          and body["replacements"][0]["candidate_id"] == "a-isc",
+          str(body.get("replacements")))
+
+    # -- zero-cost identical-expression candidate changes nothing -----------
+    code, body = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                      {"components": {"app": [
+                          {"id": "same", "expression": "MIT", "cost": 0}]}})
+    check("remediation: identical expression is not a change -> still conflict 409",
+          code == 409 and body.get("ready") is False
+          and body.get("total_cost") == 0 and body.get("changed_components") == 0
+          and body.get("conflicting_components") == ["app", "libap", "libg"])
+    check("remediation: failure explains conflicts",
+          all(c["type"] in ("incompatible-licenses", "same-license-clash")
+              for c in body.get("conflicts", []))
+          and body.get("reassessed", {}).get("status") == "conflict"
+          and isinstance(body.get("remediation_hash"), str))
+    fail_hash = body["remediation_hash"]
+
+    # -- no fix: best failing plan picked by (conflict count, cost, ...) -----
+    code, body = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                      {"components": {
+                          "libap": [{"id": "g3", "expression": "GPL-3.0-only", "cost": 1}],
+                          "docs": [{"id": "mit", "expression": "MIT", "cost": 1}]}})
+    check("remediation: hopeless change -> 409 best failure",
+          code == 409 and body.get("release") is False)
+    # paying for docs/MIT adds cost without removing conflicts, so the
+    # unique best failure keeps docs unchanged
+    docs_sel = next(s for s in body["selection"] if s["component"] == "docs")
+    check("remediation: best failure minimizes conflict count then cost",
+          docs_sel["candidate_id"] == "keep" and body.get("total_cost") == 0
+          and len(body.get("conflicting_components", [])) >= 3,
+          str((body.get("total_cost"), body.get("conflicting_components"))))
+
+    # failure hash is order-independent too
+    code, body3 = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                       {"components": {
+                           "docs": [{"id": "mit", "expression": "MIT", "cost": 1}],
+                           "libap": [{"id": "g3", "expression": "GPL-3.0-only", "cost": 1}]}})
+    check("remediation: failure hash order independent",
+          code == 409 and body3.get("remediation_hash") == body["remediation_hash"])
+
+    # -- 422: illegal candidates never produce partial conclusions ----------
+    cases_422 = [
+        ("invalid expression", {"components": {"app": [
+            {"id": "x", "expression": "MIT AND (", "cost": 1}]}}),
+        ("unknown license", {"components": {"app": [
+            {"id": "x", "expression": "Custom-1.0", "cost": 1}]}}),
+        ("unknown exception", {"components": {"app": [
+            {"id": "x", "expression": "MIT WITH Nope-exception", "cost": 1}]}}),
+        ("unknown component", {"components": {"ghost": [
+            {"id": "x", "expression": "MIT", "cost": 1}]}}),
+        ("negative cost", {"components": {"app": [
+            {"id": "x", "expression": "MIT", "cost": -2}]}}),
+        ("duplicate candidate id", {"components": {"app": [
+            {"id": "x", "expression": "MIT", "cost": 1},
+            {"id": "x", "expression": "ISC", "cost": 2}]}}),
+        ("reserved keep id", {"components": {"app": [
+            {"id": "keep", "expression": "MIT", "cost": 1}]}}),
+        ("missing expression", {"components": {"app": [
+            {"id": "x", "cost": 1}]}}),
+    ]
+    for label, bad in cases_422:
+        code, body = call("POST", "/v1/assessments/%s/remediation-plan" % aid, bad)
+        check("remediation: 422 %s" % label, code == 422, str(body)[:120])
+
+    # -- 400: malformed envelope ---------------------------------------------
+    code, body = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                      {"components": []})
+    check("remediation: malformed envelope 400", code == 400)
+
+    # -- 409: non-conflict assessment; 404: unknown assessment ---------------
+    code, ok_body = call("POST", "/v1/assessments",
+                         {"components": [{"id": "a", "license": "MIT"}]})
+    code, body = call("POST", "/v1/assessments/%s/remediation-plan" % ok_body["id"],
+                      {"components": {}})
+    check("remediation: non-conflict assessment 409",
+          code == 409 and body.get("reason") == "not-conflict")
+    code, body = call("POST", "/v1/assessments/%s/remediation-plan" % ("f" * 32),
+                      {"components": {}})
+    check("remediation: unknown assessment 404", code == 404)
+
+    # -- pinned snapshot: overwriting the ruleset does not change the plan ---
+    plan_before = None
+    code, plan_before = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                             plan_body)
+    # overwrite default ruleset (draft + activate flow with a tweak that
+    # would make Apache-2.0 compatible with GPL-2.0-only if it were used)
+    code, rules_resp = call("GET", "/v1/rulesets/default")
+    active_rev = rules_resp.get("active_revision")
+    tweaked = json.loads(json.dumps(rules_resp["ruleset"]))
+    tweaked["licenses"]["Apache-2.0"]["incompatible_with"] = []
+    code, rev = call("POST", "/v1/rulesets/default/revisions",
+                     {"rules": tweaked, "base_revision": active_rev})
+    check("remediation: tweak revision drafted", code == 200)
+    code, act = call(
+        "POST", "/v1/rulesets/default/revisions/%s/activate" % rev["revision"],
+        {"expected_active_revision": active_rev})
+    check("remediation: tweak activated", code == 200, str(act)[:120])
+    code, plan_after = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                            plan_body)
+    check("remediation: plan computed from pinned snapshot, not active rules",
+          code == 200 and plan_after["remediation_hash"] == plan_before["remediation_hash"])
+    # roll back to the original ruleset for the remaining checks
+    call("POST", "/v1/rulesets/default/revisions/%s/activate" % active_rev,
+         {"expected_active_revision": rev["revision"]})
+
+    # -- candidate OR expressions resolve against the pinned rules ----------
+    code, body = call("POST", "/v1/assessments/%s/remediation-plan" % aid,
+                      {"components": {"libap": [
+                          {"id": "dual",
+                           "expression": "Apache-2.0 OR MIT", "cost": 5}]}})
+    check("remediation: candidate OR expression re-solved to feasible branch",
+          code == 200 and body.get("release") is True
+          and body["adopted"].get("libap") == "MIT")
+
+    # -- large choice space: branch-and-bound agrees with exhaustive ---------
+    many = {"components": {
+        cid: [
+            {"id": "m%d" % k, "expression": lid, "cost": k + 1}
+            for k, lid in enumerate(["MIT", "ISC", "BSD-2-Clause"])
+        ]
+        for cid in ("app", "libap")
+    }}
+    # 4 options per component (3 + keep) over 2 components is still small;
+    # force the large path via many components: 4^7 > 4096
+    big_req = {
+        "components": [
+            {"id": "hub", "license": "GPL-2.0-only", "linkage": "static"},
+        ] + [
+            {"id": "ap%d" % i, "license": "Apache-2.0", "linkage": "static"}
+            for i in range(7)
+        ],
+        "dependencies": [
+            {"from": "hub", "to": "ap%d" % i} for i in range(7)
+        ],
+    }
+    code, big = call("POST", "/v1/assessments", big_req)
+    check("remediation: big fixture conflicts", code == 200
+          and big["result"]["status"] == "conflict")
+    big_body = {"components": {
+        "ap%d" % i: [
+            {"id": "m0", "expression": "MIT", "cost": 1},
+            {"id": "m1", "expression": "ISC", "cost": 2},
+            {"id": "m2", "expression": "BSD-2-Clause", "cost": 3},
+        ]
+        for i in range(7)
+    }}
+    code, body = call("POST", "/v1/assessments/%s/remediation-plan" % big["id"],
+                      big_body)
+    check("remediation: large space solved via branch-and-bound",
+          code == 200 and body.get("selection_mode") == "branch-and-bound"
+          and body.get("release") is True,
+          str((code, body.get("selection_mode"), body.get("total_cost"))))
+    # each GPL/Apache pair conflicts separately at hub, so all 7 Apache
+    # components must move off Apache-2.0; cheapest candidate everywhere
+    # is m0/MIT -> total 7, 7 changes, lexicographic first
+    check("remediation: large space global optimum",
+          body.get("total_cost") == 7 and body.get("changed_components") == 7
+          and [(r["component"], r["candidate_id"]) for r in body["replacements"]]
+          == [("ap%d" % i, "m0") for i in range(7)],
+          str(body.get("replacements")))
+
+    # solver-level equivalence: exhaustive vs branch-and-bound, random
+    # remediation instances must give identical normalized answers
+    import math as _math
+    import random
+    from app import remediation as rem_mod
+
+    rng = random.Random(20260930)
+    licenses_pool = ["MIT", "ISC", "Apache-2.0", "GPL-2.0-only",
+                     "GPL-3.0-only", "BSD-3-Clause", "CC0-1.0"]
+    mismatches = 0
+    for trial in range(24):
+        n = 2 + int(rng.random() * 4)
+        comps = [
+            {"id": "c%d" % i,
+             "license": licenses_pool[int(rng.random() * len(licenses_pool))],
+             "linkage": "static"}
+            for i in range(n)
+        ]
+        # one shared dependent so incompatible licenses co-exist there
+        deps = [{"from": "c%d" % j, "to": "c0"} for j in range(1, n)]
+        norm = normalize_request({"components": comps, "dependencies": deps})
+        rules = validate_ruleset(DEFAULT_RULESET)
+        if assess_normalized(norm, rules)["status"] != "conflict":
+            continue
+        choices = rem_mod.normalize_candidates(
+            {"components": {
+                "c%d" % i: [
+                    {"id": "q%d" % k,
+                     "expression": licenses_pool[int(rng.random() * len(licenses_pool))],
+                     "cost": int(rng.random() * 3)}
+                    for k in range(3)
+                ]
+                for i in range(n)
+            }},
+            norm, rules,
+        )
+        scale = 1
+        for opts in choices.values():
+            for opt in opts:
+                d = opt["cost"].denominator
+                scale = scale * d // _math.gcd(scale, d)
+        orig = rem_mod.MAX_REMEDIATION_COMBINATIONS
+        rem_mod.MAX_REMEDIATION_COMBINATIONS = 0
+        try:
+            mode_b, rel_b, fail_b = rem_mod._solve(norm, rules, choices, scale)
+        finally:
+            rem_mod.MAX_REMEDIATION_COMBINATIONS = orig
+        mode_e, rel_e, fail_e = rem_mod._solve(norm, rules, choices, scale)
+        key_b = None if rel_b is None else rel_b[0]
+        key_e = None if rel_e is None else rel_e[0]
+        if mode_b != "branch-and-bound" or (key_b,
+                None if fail_b is None else fail_b[0]) != (key_e,
+                None if fail_e is None else fail_e[0]):
+            mismatches += 1
+    check("remediation: branch-and-bound == exhaustive", mismatches == 0,
+          "%d mismatches" % mismatches)
+
+
+def run_compare_checks(call, check):
+    """End-to-end checks for POST /v1/assessments/compare."""
+    # baseline fixture: ok assessment adopting the constraint-forced branch
+    base_request = {
+        "product": "cmp-base",
+        "distribution": "binary",
+        "components": [
+            {"id": "app", "license": "MIT"},
+            {"id": "liba", "license": "Apache-2.0 OR MIT", "linkage": "static"},
+            {"id": "libb", "license": "GPL-2.0-only", "linkage": "static"},
+        ],
+        "dependencies": [
+            {"from": "app", "to": "liba"},
+            {"from": "app", "to": "libb"},
+        ],
+    }
+    code, body = call("POST", "/v1/assessments", base_request)
+    base_id = body.get("id")
+    base_hash = body.get("result", {}).get("summary_hash")
+    check("compare: baseline fixture ok",
+          code == 200 and body.get("result", {}).get("status") == "ok",
+          json.dumps(body)[:200])
+
+    def compare(bid, tid):
+        return call("POST", "/v1/assessments/compare",
+                    {"baseline_id": bid, "target_id": tid})
+
+    # -- target that conflicts: one component diff, fully attributed ---------
+    conflict_request = json.loads(json.dumps(base_request))
+    conflict_request["components"][1]["license"] = "Apache-2.0"
+    code, body = call("POST", "/v1/assessments", conflict_request)
+    conflict_id = body.get("id")
+    check("compare: conflict target fixture",
+          code == 200 and body.get("result", {}).get("status") == "conflict")
+
+    code, out = compare(base_id, conflict_id)
+    check("compare: 200 with one atomic component diff",
+          code == 200 and out.get("diff_count") == 1
+          and out.get("diffs", [{}])[0].get("kind") == "component"
+          and out.get("diffs", [{}])[0].get("component") == "liba"
+          and out.get("diffs", [{}])[0].get("change") == "changed"
+          and out.get("diffs", [{}])[0].get("id") == "D0001",
+          json.dumps(out)[:300] if code == 200 else str(out))
+    check("compare: minimal set rolls the single diff back",
+          out.get("minimal_set") == ["D0001"] and out.get("minimal_size") == 1
+          and out.get("conclusions_agree") is False)
+    check("compare: counterfactual restores the baseline conclusion",
+          out.get("counterfactual", {}).get("status") == "ok"
+          and out.get("counterfactual", {}).get("summary_hash") == base_hash
+          and out.get("counterfactual", {}).get("restores_baseline_conclusion") is True)
+    cmp_hash = out.get("comparison_hash")
+    code, out2 = compare(base_id, conflict_id)
+    check("compare: deterministic comparison_hash",
+          code == 200 and out2.get("comparison_hash") == cmp_hash)
+
+    # -- conclusions already agree -> empty attribution set ------------------
+    renamed = dict(base_request, product="cmp-renamed")
+    code, body = call("POST", "/v1/assessments", renamed)
+    renamed_id = body.get("id")
+    code, out = compare(base_id, renamed_id)
+    check("compare: agreeing conclusions yield empty minimal set",
+          code == 200 and out.get("conclusions_agree") is True
+          and out.get("minimal_set") == []
+          and [d["kind"] for d in out.get("diffs", [])] == ["product"],
+          json.dumps(out)[:300] if code == 200 else str(out))
+
+    # -- minimal set is a strict subset; illegal intermediates are skipped ---
+    # target: product renamed (D0001, neutral), liba expression simplified
+    # (D0002, neutral: the adopted branch is unchanged), component libg added
+    # (D0003) plus its dependency edge (D0004).  Rolling back D0003 alone
+    # leaves a dangling edge (illegal intermediate, must not count); rolling
+    # back D0004 alone keeps the extra component (conclusion differs).  Only
+    # {D0003, D0004} restores the baseline conclusion.
+    grown = json.loads(json.dumps(base_request))
+    grown["product"] = "cmp-grown"
+    grown["components"][1]["license"] = "MIT"
+    grown["components"].append(
+        {"id": "libg", "license": "GPL-2.0-only", "linkage": "static"})
+    grown["dependencies"].append({"from": "app", "to": "libg"})
+    code, body = call("POST", "/v1/assessments", grown)
+    grown_id = body.get("id")
+    check("compare: grown target fixture ok",
+          code == 200 and body.get("result", {}).get("status") == "ok")
+    code, out = compare(base_id, grown_id)
+    check("compare: four atomic diffs decomposed",
+          code == 200 and out.get("diff_count") == 4
+          and [(d["id"], d["kind"]) for d in out.get("diffs", [])]
+          == [("D0001", "product"), ("D0002", "component"),
+              ("D0003", "component"), ("D0004", "dependency")],
+          json.dumps(out.get("diffs"))[:300] if code == 200 else str(out))
+    check("compare: minimal set skips neutral diffs and illegal states",
+          out.get("minimal_set") == ["D0003", "D0004"]
+          and out.get("counterfactual", {}).get("status") == "ok",
+          json.dumps(out.get("minimal_set")))
+
+    # -- license-rule diff ----------------------------------------------------
+    solo = {"components": [{"id": "solo", "license": "X-1.0"}]}
+    rules_b = {"licenses": {"X-1.0": {"obligations": ["attribution"]}}}
+    rules_t = {"licenses": {"X-1.0": {"obligations": ["attribution", "license-text"]}}}
+    code, body = call("POST", "/v1/assessments", dict(solo, rules=rules_b))
+    rule_base_id, rule_base_hash = body.get("id"), body.get("result", {}).get("summary_hash")
+    code, body = call("POST", "/v1/assessments", dict(solo, rules=rules_t))
+    rule_target_id = body.get("id")
+    code, out = compare(rule_base_id, rule_target_id)
+    check("compare: license-rule diff attributed",
+          code == 200 and out.get("diff_count") == 1
+          and out.get("diffs", [{}])[0].get("kind") == "license-rule"
+          and out.get("diffs", [{}])[0].get("license") == "X-1.0"
+          and out.get("minimal_set") == ["D0001"]
+          and out.get("counterfactual", {}).get("summary_hash") == rule_base_hash,
+          json.dumps(out)[:300] if code == 200 else str(out))
+
+    # -- lexicographic tie-break between two restoring single diffs ----------
+    # Reverting the distribution change (D0001) *or* the license-rule change
+    # (D0002) each restores the baseline conclusion: network-source only
+    # applies under saas, so either rollback alone reproduces the baseline
+    # obligations.  The lexicographically smaller id sequence must win.
+    tie_rules_b = {
+        "licenses": {
+            "MIT": {"obligations": ["attribution"]},
+            "GPL-2.0-only": {"obligations": ["attribution", "source-offer"],
+                             "propagates": ["static"]},
+        },
+        "obligation_scopes": {"network-source": ["saas"]},
+    }
+    tie_rules_t = json.loads(json.dumps(tie_rules_b))
+    tie_rules_t["licenses"]["GPL-2.0-only"]["obligations"].append("network-source")
+    tie_req = {
+        "components": [
+            {"id": "app", "license": "MIT"},
+            {"id": "libg", "license": "GPL-2.0-only", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "app", "to": "libg"}],
+        "rules": tie_rules_b,
+    }
+    code, body = call("POST", "/v1/assessments",
+                      dict(tie_req, distribution="binary"))
+    tie_base_id = body.get("id")
+    code, body = call("POST", "/v1/assessments",
+                      dict(tie_req, distribution="saas", rules=tie_rules_t))
+    tie_target_id = body.get("id")
+    code, out = compare(tie_base_id, tie_target_id)
+    check("compare: lexicographic diff-id tie-break",
+          code == 200 and out.get("minimal_size") == 1
+          and out.get("minimal_set") == ["D0001"]
+          and [d["kind"] for d in out.get("diffs", [])]
+          == ["distribution", "license-rule"],
+          json.dumps(out.get("minimal_set")) if code == 200 else str(out))
+
+    # -- exception-rule / obligation-scope / combined-work-linkage diffs -----
+    exc_rules_b = {
+        "licenses": {
+            "MIT": {"obligations": ["attribution"]},
+            "GPL-2.0-only": {"obligations": ["attribution", "same-license"],
+                             "propagates": ["static"]},
+        },
+        "exceptions": {"E-1": {"removes": ["same-license"],
+                               "removes_propagation": True}},
+        "combined_work_linkages": ["static", "dynamic"],
+    }
+    exc_rules_t = {
+        "licenses": exc_rules_b["licenses"],
+        "combined_work_linkages": ["static"],
+        "obligation_scopes": {"attribution": ["binary"]},
+    }
+    exc_req = {"distribution": "binary",
+               "components": [{"id": "rt", "license": "GPL-2.0-only WITH E-1",
+                               "linkage": "dynamic"}]}
+    code, body = call("POST", "/v1/assessments", dict(exc_req, rules=exc_rules_b))
+    exc_base_id = body.get("id")
+    check("compare: exception baseline fixture ok",
+          code == 200 and body.get("result", {}).get("status") == "ok")
+    code, body = call("POST", "/v1/assessments", dict(exc_req, rules=exc_rules_t))
+    exc_target_id = body.get("id")
+    check("compare: removed exception rule breaks target",
+          code == 200 and body.get("result", {}).get("status") == "missing-rules")
+    code, out = compare(exc_base_id, exc_target_id)
+    check("compare: rule-section diff kinds decomposed",
+          code == 200
+          and [(d["id"], d["kind"]) for d in out.get("diffs", [])]
+          == [("D0001", "exception-rule"), ("D0002", "obligation-scope"),
+              ("D0003", "combined-work-linkage")],
+          json.dumps(out.get("diffs"))[:300] if code == 200 else str(out))
+    check("compare: only the exception-rule rollback is attributed",
+          out.get("minimal_set") == ["D0001"]
+          and out.get("counterfactual", {}).get("status") == "ok")
+
+    # -- removed component / removed edge ------------------------------------
+    shrunk_base = {
+        "components": [
+            {"id": "app", "license": "MIT"},
+            {"id": "libx", "license": "MIT", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "app", "to": "libx"}],
+    }
+    code, body = call("POST", "/v1/assessments", shrunk_base)
+    shrunk_base_id = body.get("id")
+    code, body = call("POST", "/v1/assessments",
+                      {"components": [{"id": "app", "license": "MIT"}]})
+    shrunk_target_id = body.get("id")
+    code, out = compare(shrunk_base_id, shrunk_target_id)
+    check("compare: removed component and edge decomposed",
+          code == 200
+          and [(d["kind"], d.get("change")) for d in out.get("diffs", [])]
+          == [("component", "removed"), ("dependency", "removed")],
+          json.dumps(out.get("diffs"))[:300] if code == 200 else str(out))
+    check("compare: outcome-neutral edge removal is not attributed",
+          out.get("minimal_set") == ["D0001"]
+          and out.get("counterfactual", {}).get("status") == "ok")
+
+    # -- conflict explanation restored ----------------------------------------
+    clash_base = {
+        "components": [
+            {"id": "app", "license": "MIT"},
+            {"id": "libg", "license": "GPL-2.0-only", "linkage": "static"},
+            {"id": "libap", "license": "Apache-2.0", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "app", "to": "libg"},
+                         {"from": "app", "to": "libap"}],
+    }
+    code, body = call("POST", "/v1/assessments", clash_base)
+    clash_base_id, clash_base_hash = body.get("id"), body.get("result", {}).get("summary_hash")
+    check("compare: conflict baseline fixture",
+          code == 200 and body.get("result", {}).get("status") == "conflict")
+    clash_target = json.loads(json.dumps(clash_base))
+    clash_target["components"][2]["license"] = "MIT"
+    code, body = call("POST", "/v1/assessments", clash_target)
+    clash_target_id = body.get("id")
+    code, out = compare(clash_base_id, clash_target_id)
+    check("compare: conflict explanation restored by rollback",
+          code == 200 and out.get("minimal_set") == ["D0001"]
+          and out.get("counterfactual", {}).get("status") == "conflict"
+          and out.get("counterfactual", {}).get("summary_hash") == clash_base_hash,
+          json.dumps(out.get("counterfactual")) if code == 200 else str(out))
+
+    # -- self comparison ------------------------------------------------------
+    code, out = compare(base_id, base_id)
+    check("compare: self comparison has no diffs",
+          code == 200 and out.get("diff_count") == 0
+          and out.get("minimal_set") == []
+          and out.get("conclusions_agree") is True)
+
+    # -- errors ----------------------------------------------------------------
+    code, out = compare("0" * 32, base_id)
+    check("compare: unknown baseline -> 404", code == 404)
+    code, out = compare(base_id, "f" * 32)
+    check("compare: unknown target -> 404", code == 404)
+    code, out = call("POST", "/v1/assessments/compare", {"baseline_id": base_id})
+    check("compare: missing target_id -> 400", code == 400)
+    code, out = call("POST", "/v1/assessments/compare", ["not", "an", "object"])
+    check("compare: non-object body -> 400", code == 400)
+
+    # -- statelessness: neither assessment is mutated by comparing ------------
+    code, body = call("GET", "/v1/assessments/%s" % base_id)
+    check("compare: baseline assessment unchanged",
+          code == 200 and body.get("result", {}).get("summary_hash") == base_hash)
+
+
+def run_revision_checks():
+    """Exercise immutable revisions end to end.
+
+    Covers: content-hash identity, the first revision staying an
+    unpublished draft (invisible to legacy GET, ruleset listing and named
+    accounting; history reports active_revision null), first publish via
+    CAS with expected_active_revision null, draft deduplication,
+    optimistic base_revision (409 stale-base), compare-and-set
+    activation (409 active-moved), in-transaction active-revision read
+    for assessments, history listing, old-revision rollback via the same
+    CAS flow, history immutability, unknown-revision handling, real
+    activation races (later and first publishes) between two threads, and
+    fresh-DB revision seeding.
+    """
+    v1 = {"licenses": {"Z-1.0": {"obligations": ["attribution"]}}}
+    v2 = {"licenses": {"Z-1.0": {"obligations": ["attribution", "license-text"]}}}
+    v1_permuted = {
+        "licenses": {"Z-1.0": {"obligations": ["attribution", "attribution"]}},
+        "combined_work_linkages": ["dynamic", "static"],
+    }
+
+    # first revision with base_revision null only SAVES an immutable draft:
+    # no active pointer, no activation audit and no legacy mirror
+    code, body = call("POST", "/v1/rulesets/revset/revisions",
+                      {"rules": v1, "base_revision": None})
+    r1 = body.get("revision")
+    check(
+        "revision: first revision is an unpublished draft",
+        code == 200 and body.get("created") is True and body.get("active") is False
+        and body.get("base_revision") is None
+        and r1 is not None and len(r1) == 16,
+        json.dumps(body)[:200],
+    )
+    check(
+        "revision: id is content hash",
+        r1 == stable_hash(validate_ruleset(v1))[:16]
+        and body.get("content_hash") == stable_hash(validate_ruleset(v1)),
+    )
+
+    # re-submitting the identical first draft deduplicates, stays unpublished
+    code, body_again = call("POST", "/v1/rulesets/revset/revisions",
+                            {"rules": v1, "base_revision": None})
+    check(
+        "revision: re-submitted first draft deduplicated",
+        code == 200 and body_again.get("created") is False
+        and body_again.get("revision") == r1 and body_again.get("active") is False,
+        json.dumps(body_again)[:200],
+    )
+
+    # draft stage: legacy GET, the ruleset listing and named accounting must
+    # not observe the ruleset; its history exists with a null active revision
+    code, body = call("GET", "/v1/rulesets/revset")
+    check("revision: legacy GET hides unpublished draft", code == 404)
+    code, body = call("GET", "/v1/rulesets")
+    check(
+        "revision: ruleset listing excludes unpublished draft",
+        code == 200 and "revset" not in body.get("rulesets", []),
+    )
+    code, hist = call("GET", "/v1/rulesets/revset/revisions")
+    check(
+        "revision: draft history has null active revision and no audits",
+        code == 200 and hist.get("active_revision") is None
+        and [r["revision"] for r in hist.get("revisions", [])] == [r1]
+        and hist["revisions"][0]["active"] is False
+        and hist.get("activations") == [],
+        json.dumps(hist)[:200],
+    )
+    code, body = call("POST", "/v1/assessments",
+                      {"product": "revprod", "ruleset": "revset",
+                       "components": [{"id": "z", "license": "Z-1.0"}]})
+    check("revision: named assessment against unpublished draft -> 404",
+          code == 404)
+
+    # first publish goes through the CAS activate endpoint with a null
+    # expectation; a non-null expectation loses the compare-and-set and
+    # publishes nothing
+    code, body = call("POST", "/v1/rulesets/revset/revisions/%s/activate" % r1,
+                      {"expected_active_revision": "0" * 16})
+    check(
+        "revision: first publish with stale non-null expectation -> 409",
+        code == 409 and body.get("reason") == "active-moved"
+        and body.get("expected_active_revision") == "0" * 16
+        and body.get("active_revision") is None,
+        json.dumps(body)[:200],
+    )
+    code, hist = call("GET", "/v1/rulesets/revset/revisions")
+    check("revision: failed first publish leaves no audit",
+          hist.get("active_revision") is None
+          and hist.get("activations") == [])
+    code, body = call("POST", "/v1/rulesets/revset/revisions/%s/activate" % r1,
+                      {"expected_active_revision": None})
+    check(
+        "revision: first publish via CAS with null expectation",
+        code == 200 and body.get("active_revision") == r1
+        and body.get("activated") is True
+        and body.get("previous_revision") is None
+        and body.get("activated_at"),
+        json.dumps(body)[:200],
+    )
+    # legacy GET and listing observe the ruleset only after the publish
+    code, body = call("GET", "/v1/rulesets/revset")
+    check(
+        "revision: legacy GET follows first publish",
+        code == 200 and body.get("ruleset") == validate_ruleset(v1)
+        and body.get("active_revision") == r1,
+    )
+    code, body = call("GET", "/v1/rulesets")
+    check("revision: ruleset listing includes published ruleset",
+          code == 200 and "revset" in body.get("rulesets", []))
+
+    # normalized-identical payloads collapse onto the same revision
+    code, body_same = call("POST", "/v1/rulesets/revset/revisions",
+                           {"rules": v1_permuted, "base_revision": r1})
+    check(
+        "revision: equal normalized content deduplicated",
+        code == 200 and body_same.get("created") is False
+        and body_same.get("revision") == r1
+        and body_same.get("active") is True,
+        json.dumps(body_same)[:200],
+    )
+
+    # a draft of new content is created but not activated
+    code, body = call("POST", "/v1/rulesets/revset/revisions",
+                      {"rules": v2, "base_revision": r1})
+    r2 = body.get("revision")
+    check(
+        "revision: new content creates inactive draft",
+        code == 200 and body.get("created") is True and body.get("active") is False
+        and r2 != r1 and body.get("base_revision") == r1,
+    )
+    code, body = call("GET", "/v1/rulesets/revset")
+    check("revision: draft leaves active unchanged",
+          body.get("active_revision") == r1)
+
+    # stale base: drafting against a non-current baseline -> 409
+    code, body = call("POST", "/v1/rulesets/revset/revisions",
+                      {"rules": v1, "base_revision": "0" * 16})
+    check(
+        "revision: stale base_revision -> 409",
+        code == 409 and body.get("reason") == "stale-base"
+        and body.get("active_revision") == r1,
+        json.dumps(body)[:200],
+    )
+
+    # missing / mistyped fields -> 400
+    code, body = call("POST", "/v1/rulesets/revset/revisions",
+                      {"rules": v2})
+    check("revision: missing base_revision -> 400", code == 400)
+    code, body = call("POST", "/v1/rulesets/revset/revisions/%s/activate" % r2,
+                      {})
+    check("revision: missing expected_active_revision -> 400", code == 400)
+    code, body = call("POST", "/v1/rulesets/revset/revisions/%s/activate" % r2,
+                      {"expected_active_revision": 123})
+    check("revision: mistyped expected_active_revision -> 400", code == 400)
+    code, body = call("POST", "/v1/rulesets/revset/revisions/%s/activate" % r2,
+                      {"expected_active_revision": "0" * 16})
+    check(
+        "revision: CAS mismatch -> 409 active-moved",
+        code == 409 and body.get("reason") == "active-moved"
+        and body.get("active_revision") == r1,
+    )
+    code, body = call("GET", "/v1/rulesets/revset")
+    check("revision: failed CAS leaves active unchanged",
+          body.get("active_revision") == r1)
+
+    # activating an unknown revision -> 404
+    code, body = call("POST", "/v1/rulesets/revset/revisions/%s/activate" % ("a" * 16),
+                      {"expected_active_revision": r1})
+    check("revision: unknown revision activate -> 404", code == 404)
+
+    # successful activation of the draft
+    code, body = call("POST", "/v1/rulesets/revset/revisions/%s/activate" % r2,
+                      {"expected_active_revision": r1})
+    check(
+        "revision: CAS activation succeeds",
+        code == 200 and body.get("active_revision") == r2
+        and body.get("activated") is True
+        and body.get("previous_revision") == r1
+        and body.get("activated_at"),
+    )
+    # idempotent re-activation adds no audit entry
+    code, body2 = call("POST", "/v1/rulesets/revset/revisions/%s/activate" % r2,
+                       {"expected_active_revision": r2})
+    check(
+        "revision: activate already active is idempotent",
+        code == 200 and body2.get("activated") is False
+        and body2.get("activated_at") == body.get("activated_at"),
+    )
+    code, body = call("GET", "/v1/rulesets/revset")
+    check("revision: GET follows new active",
+          code == 200 and body.get("active_revision") == r2
+          and body.get("ruleset") == validate_ruleset(v2))
+
+    # legacy PUT stays compatible and appends+activates a revision
+    v3 = {"licenses": {"Z-1.0": {"obligations": ["attribution", "same-license"]}}}
+    code, body = call("PUT", "/v1/rulesets/revset", v3)
+    r3 = call("GET", "/v1/rulesets/revset")[1].get("active_revision")
+    check(
+        "revision: legacy PUT appends and activates",
+        code == 200 and r3 not in (r1, r2)
+        and r3 == stable_hash(validate_ruleset(v3))[:16],
+    )
+
+    # history lists every revision, never overwritten or deleted
+    code, hist = call("GET", "/v1/rulesets/revset/revisions")
+    revs = hist.get("revisions", [])
+    check(
+        "revision: history complete and immutable",
+        code == 200 and [r["revision"] for r in revs] == [r1, r2, r3]
+        and [r["active"] for r in revs] == [False, False, True]
+        and revs[0]["ruleset"] == validate_ruleset(v1)
+        and revs[1]["ruleset"] == validate_ruleset(v2)
+        and revs[0]["content_hash"] == stable_hash(validate_ruleset(v1)),
+        str([r["revision"] for r in revs]),
+    )
+    check(
+        "revision: activation audit chain",
+        [a["revision"] for a in hist.get("activations", [])]
+        == [r1, r2, r3]
+        and [a["previous_revision"] for a in hist.get("activations", [])]
+        == [None, r1, r2],
+        json.dumps(hist.get("activations"))[:300],
+    )
+
+    # assessments read the active revision in-transaction and record it
+    areq = {"product": "revprod", "ruleset": "revset",
+            "components": [{"id": "z", "license": "Z-1.0"}]}
+    code, body = call("POST", "/v1/assessments", areq)
+    aid3, aobs3 = body.get("id"), body["result"]["artifact_obligations"]
+    check(
+        "revision: assessment bound to active revision",
+        code == 200 and body.get("ruleset_revision") == r3
+        and "same-license" in aobs3 and "license-text" not in aobs3,
+    )
+    code, got = call("GET", "/v1/assessments/" + aid3)
+    check(
+        "revision: stored assessment records revision id",
+        code == 200 and got.get("revision") == r3 and got.get("ruleset") == "revset",
+    )
+
+    # rollback: activate the old r1 with the same CAS flow
+    code, body = call("POST", "/v1/rulesets/revset/revisions/%s/activate" % r1,
+                      {"expected_active_revision": r3})
+    check(
+        "revision: CAS rollback to old revision",
+        code == 200 and body.get("active_revision") == r1
+        and body.get("previous_revision") == r3,
+    )
+    # rollback creates no new content row, just another activation record;
+    # all historical content remains
+    code, hist2 = call("GET", "/v1/rulesets/revset/revisions")
+    check(
+        "revision: history survives rollback untouched",
+        [r["revision"] for r in hist2.get("revisions", [])] == [r1, r2, r3]
+        and len(hist2.get("activations", [])) == 4
+        and hist2.get("active_revision") == r1,
+    )
+    code, body = call("POST", "/v1/assessments", areq)
+    check(
+        "revision: fresh assessment follows rolled-back revision",
+        code == 200 and body.get("ruleset_revision") == r1
+        and body.get("id") != aid3
+        and "same-license" not in body["result"]["artifact_obligations"],
+    )
+    # the old assessment's pinned result/revision are unchanged
+    code, got = call("GET", "/v1/assessments/" + aid3)
+    check(
+        "revision: rollback does not mutate prior assessment",
+        got.get("revision") == r3 and "same-license"
+        in got["result"]["artifact_obligations"],
+    )
+
+    # unknown ruleset history -> 404
+    code, body = call("GET", "/v1/rulesets/no-such-rs/revisions")
+    check("revision: history of unknown ruleset -> 404", code == 404)
+    # drafting for a not-yet-existing ruleset requires base_revision null,
+    # and the draft stays unpublished until an explicit first activation
+    code, body = call("POST", "/v1/rulesets/brandnew/revisions",
+                      {"rules": v1, "base_revision": r1})
+    check(
+        "revision: non-null base on missing ruleset -> 409",
+        code == 409 and body.get("reason") == "stale-base"
+        and body.get("active_revision") is None,
+    )
+    code, body = call("POST", "/v1/rulesets/brandnew/revisions",
+                      {"rules": v1, "base_revision": None})
+    b1 = body.get("revision")
+    check(
+        "revision: first revision via revisions endpoint stays a draft",
+        code == 200 and body.get("active") is False
+        and body.get("base_revision") is None and b1 is not None,
+    )
+    code, body = call("GET", "/v1/rulesets/brandnew")
+    check("revision: unpublished brandnew hidden from legacy GET", code == 404)
+    code, hist = call("GET", "/v1/rulesets/brandnew/revisions")
+    check(
+        "revision: brandnew draft history has null active revision",
+        code == 200 and hist.get("active_revision") is None
+        and hist.get("activations") == []
+        and [r["revision"] for r in hist["revisions"]] == [b1],
+    )
+    # activating an unknown revision of a draft-only ruleset -> 404
+    code, body = call(
+        "POST", "/v1/rulesets/brandnew/revisions/%s/activate" % ("a" * 16),
+        {"expected_active_revision": None})
+    check("revision: unknown revision of draft-only ruleset -> 404", code == 404)
+    code, body = call(
+        "POST", "/v1/rulesets/brandnew/revisions/%s/activate" % b1,
+        {"expected_active_revision": None})
+    check(
+        "revision: brandnew first publish via null CAS expectation",
+        code == 200 and body.get("active_revision") == b1
+        and body.get("activated") is True
+        and body.get("previous_revision") is None,
+    )
+    code, body = call(
+        "POST", "/v1/rulesets/brandnew/revisions/%s/activate" % b1,
+        {"expected_active_revision": b1})
+    check(
+        "revision: brandnew re-activation is idempotent",
+        code == 200 and body.get("activated") is False,
+    )
+    code, hist = call("GET", "/v1/rulesets/brandnew/revisions")
+    check(
+        "revision: brandnew has exactly one first-publish audit",
+        hist.get("active_revision") == b1 and len(hist.get("activations", [])) == 1
+        and hist["activations"][0]["previous_revision"] is None,
+    )
+
+    # legacy PUT stays able to publish a draft-only name created via revisions
+    code, body = call("POST", "/v1/rulesets/legacyboot/revisions",
+                      {"rules": v2, "base_revision": None})
+    lb = body["revision"]
+    check("revision: draft-only name before legacy PUT is hidden",
+          call("GET", "/v1/rulesets/legacyboot")[0] == 404)
+    code, body = call("PUT", "/v1/rulesets/legacyboot", v2)
+    check(
+        "revision: legacy PUT publishes draft-only ruleset",
+        code == 200 and body.get("created") is True
+        and call("GET", "/v1/rulesets/legacyboot")[1].get("active_revision") == lb,
+    )
+    hist = call("GET", "/v1/rulesets/legacyboot/revisions")[1]
+    check(
+        "revision: legacy PUT publish reuses draft row, one audit",
+        [r["revision"] for r in hist["revisions"]] == [lb]
+        and len(hist["activations"]) == 1,
+    )
+
+    # -- real concurrency: two first-publish activations, one wins ----------
+    code, fp = call("POST", "/v1/rulesets/firstrace/revisions",
+                    {"rules": v1, "base_revision": None})
+    first_target = fp["revision"]
+    outcome = {}
+
+    def first_activate(tag):
+        # Both threads CAS expecting null (no active revision yet).
+        c, b = call(
+            "POST",
+            "/v1/rulesets/firstrace/revisions/%s/activate" % first_target,
+            {"expected_active_revision": None})
+        outcome[tag] = (c, b)
+
+    th1 = threading.Thread(target=first_activate, args=("a",))
+    th2 = threading.Thread(target=first_activate, args=("b",))
+    th1.start(); th2.start(); th1.join(); th2.join()
+    codes = sorted(outcome[k][0] for k in outcome)
+    check(
+        "revision: racing first publishes -> exactly one wins",
+        codes == [200, 409],
+        str({k: v[0] for k, v in outcome.items()}),
+    )
+    loser = [k for k, v in outcome.items() if v[0] == 409][0]
+    check(
+        "revision: first-publish loser sees active-moved with winner revision",
+        outcome[loser][1].get("reason") == "active-moved"
+        and outcome[loser][1].get("expected_active_revision") is None
+        and outcome[loser][1].get("active_revision") == first_target,
+        json.dumps(outcome[loser][1])[:200],
+    )
+    hist = call("GET", "/v1/rulesets/firstrace/revisions")[1]
+    check(
+        "revision: first-publish race leaves a single audit row",
+        hist.get("active_revision") == first_target
+        and len(hist.get("activations", [])) == 1
+        and hist["activations"][0]["previous_revision"] is None,
+    )
+    # loser retries with the now-current expectation: idempotent no-op
+    code, body = call(
+        "POST", "/v1/rulesets/firstrace/revisions/%s/activate" % first_target,
+        {"expected_active_revision": first_target})
+    check("revision: first-publish loser retries idempotently",
+          code == 200 and body.get("activated") is False)
+
+    # -- real concurrency: two activations racing, exactly one wins ---------
+    race_v1 = {"licenses": {"Q-1.0": {"obligations": ["attribution"]}}}
+    race_v2 = {"licenses": {"Q-1.0": {"obligations": ["attribution", "license-text"]}}}
+    call("PUT", "/v1/rulesets/raceset", race_v1)
+    start = call("GET", "/v1/rulesets/raceset")[1]["active_revision"]
+    code, dr2 = call("POST", "/v1/rulesets/raceset/revisions",
+                     {"rules": race_v2, "base_revision": start})
+    target = dr2["revision"]
+    outcome = {}
+
+    def activate(tag):
+        # Both threads CAS expecting the same starting revision.
+        c, b = call("POST", "/v1/rulesets/raceset/revisions/%s/activate" % target,
+                    {"expected_active_revision": start})
+        outcome[tag] = (c, b)
+
+    th1 = threading.Thread(target=activate, args=("a",))
+    th2 = threading.Thread(target=activate, args=("b",))
+    th1.start(); th2.start(); th1.join(); th2.join()
+    codes = sorted(outcome[k][0] for k in outcome)
+    check(
+        "revision: racing activations -> exactly one wins",
+        codes == [200, 409],
+        str({k: v[0] for k, v in outcome.items()}),
+    )
+    loser = [k for k, v in outcome.items() if v[0] == 409][0]
+    check(
+        "revision: loser sees active-moved with current revision",
+        outcome[loser][1].get("reason") == "active-moved"
+        and outcome[loser][1].get("active_revision") == target,
+    )
+    # after the conflict, the loser retries with the fresh expectation
+    code, body = call("POST", "/v1/rulesets/raceset/revisions/%s/activate" % target,
+                      {"expected_active_revision": target})
+    check("revision: retry with fresh expectation is idempotent",
+          code == 200 and body.get("activated") is False)
+
+    # -- fresh database seeds its first active revision ----------------------
+    run_revision_fresh_db_checks()
+
+
+def run_revision_fresh_db_checks():
+    """A brand-new (and a pre-revision) database expose revisions sanely."""
+    tmp = tempfile.mkdtemp(prefix="licapi-revs-")
+    db = os.path.join(tmp, "fresh.db")
+    api = Api(Store(db))
+    api.store.put_ruleset("default", validate_ruleset(DEFAULT_RULESET))
+    expected = stable_hash(validate_ruleset(DEFAULT_RULESET))[:16]
+    hist = api.store.list_ruleset_revisions("default")
+    check(
+        "fresh db: seeded default is first active revision",
+        hist is not None and hist["active_revision"] == expected
+        and len(hist["revisions"]) == 1 and len(hist["activations"]) == 1,
+    )
+    # legacy pre-revision schema is migrated to first active revisions
+    db2 = os.path.join(tmp, "legacy-rs.db")
+    conn = sqlite3.connect(db2)
+    conn.executescript(
+        """
+        CREATE TABLE rulesets (
+            name TEXT PRIMARY KEY, body TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE assessments (
+            id TEXT PRIMARY KEY, ruleset TEXT, request TEXT NOT NULL,
+            result TEXT NOT NULL, status TEXT NOT NULL,
+            summary_hash TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE confirmations (
+            assessment_id TEXT PRIMARY KEY, body TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        """
+    )
+    rules = validate_ruleset({"licenses": {"M-1.0": {"obligations": ["attribution"]}}})
+    conn.execute(
+        "INSERT INTO rulesets(name, body, created_at) VALUES (?,?,?)",
+        ("migr", json.dumps(rules, sort_keys=True), "2024-01-01T00:00:00+00:00"),
+    )
+    norm = normalize_request({"components": [{"id": "m", "license": "M-1.0"}]})
+    result = assess_normalized(norm, rules)
+    aid = stable_hash({"request": norm, "rules": rules})[:32]
+    conn.execute(
+        "INSERT INTO assessments"
+        "(id, ruleset, request, result, status, summary_hash, created_at)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (aid, "migr", json.dumps(norm, sort_keys=True),
+         json.dumps(result, sort_keys=True), result["status"],
+         result["summary_hash"], "2024-01-01T00:00:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    api2 = Api(Store(db2))
+    rid = stable_hash(rules)[:16]
+    hist = api2.store.list_ruleset_revisions("migr")
+    check(
+        "legacy db: ruleset migrated to first active revision",
+        hist is not None and hist["active_revision"] == rid
+        and len(hist["revisions"]) == 1
+        and hist["revisions"][0]["base_revision"] is None
+        and api2.store.get_ruleset("migr") == rules,
+    )
+    row = api2.store.get_assessment(aid)
+    check(
+        "legacy db: healed assessment stamped with revision",
+        row["revision"] == rid and row["rules"] == rules,
+    )
+    # migrated content can draft/activate with the new flow
+    v2 = validate_ruleset({"licenses": {"M-1.0": {"obligations": ["attribution", "license-text"]}}})
+    draft = api2.store.create_ruleset_revision("migr", v2, rid)
+    check("legacy db: draft on migrated ruleset",
+          draft["created"] is True and draft["active"] is False)
+    out = api2.store.activate_ruleset_revision("migr", draft["revision"], rid)
+    check("legacy db: CAS activate migrated ruleset",
+          out["activated"] is True and out["previous_revision"] == rid)
+    # and roll back with the same path; both content rows still present
+    out = api2.store.activate_ruleset_revision("migr", rid, draft["revision"])
+    check("legacy db: CAS rollback migrated ruleset",
+          out["activated"] is True and out["previous_revision"] == draft["revision"])
+    hist = api2.store.list_ruleset_revisions("migr")
+    check(
+        "legacy db: history never loses content",
+        [r["revision"] for r in hist["revisions"]] == [rid, draft["revision"]]
+        and len(hist["activations"]) == 3
+        and hist["active_revision"] == rid,
+    )
+
+
+def run_impact_review_checks():
+    """Exercise the pre-publication impact review end to end.
+
+    A dedicated ruleset (active r1) backs four assessments: one ok item
+    that the target revision turns into a conflict (newly incompatible
+    licenses), one ok item it turns into a missing-rules error (the
+    license rule is deleted), one item already conflicting that stays a
+    conflict, plus a foreign-ruleset/inline assessment for rejection.
+    The checks cover: report ordering and per-item old/new projection,
+    the release->conflict/error summary, request-order invariance of the
+    report_hash, envelope 400s (missing fields, 1..50 bounds, duplicate
+    and non-string ids), whole-batch 409s (stale baseline, unknown target
+    revision, unknown ruleset, unknown/foreign/mismatched-revision
+    assessments, null-baseline handling for draft-only rulesets),
+    read-transaction behavior under a real activation race, absence of
+    side effects, and reviewing the already-active revision.
+    """
+    v1 = {
+        "licenses": {
+            "P-1.0": {"obligations": ["attribution"]},
+            "F-1.0": {
+                "obligations": ["attribution", "source-offer", "same-license"],
+                "propagates": ["static"],
+            },
+            "Q-1.0": {"obligations": ["attribution"]},
+            "X-1.0": {
+                "obligations": ["attribution"],
+                "incompatible_with": ["Y-1.0"],
+            },
+            "Y-1.0": {"obligations": ["attribution"]},
+        }
+    }
+    # target draft: P/F become incompatible (A -> conflict), Q disappears
+    # (B -> missing-rules); X/Y keep clashing (C stays conflict).
+    v2 = {
+        "licenses": {
+            "P-1.0": {
+                "obligations": ["attribution"],
+                "incompatible_with": ["F-1.0"],
+            },
+            "F-1.0": {
+                "obligations": ["attribution", "source-offer", "same-license"],
+                "propagates": ["static"],
+            },
+            "X-1.0": {
+                "obligations": ["attribution"],
+                "incompatible_with": ["Y-1.0"],
+            },
+            "Y-1.0": {"obligations": ["attribution"]},
+        }
+    }
+    v3 = {
+        "licenses": dict(
+            v1["licenses"],
+            **{"P-1.0": {"obligations": ["attribution", "license-text"]}},
+        )
+    }
+
+    code, body = call("PUT", "/v1/rulesets/impact", v1)
+    check("impact: ruleset published", code == 200 and body.get("created") is True)
+    r1 = call("GET", "/v1/rulesets/impact")[1]["active_revision"]
+
+    def assess(spec):
+        code, out = call("POST", "/v1/assessments",
+                         dict({"ruleset": "impact"}, **spec))
+        check("impact: assessment accepted (%s)" % spec["product"], code == 200,
+              json.dumps(out)[:160])
+        return out
+
+    a_ok = assess({
+        "product": "a-ok",
+        "components": [
+            {"id": "app", "license": "P-1.0"},
+            {"id": "libf", "license": "F-1.0", "linkage": "dynamic"},
+        ],
+        "dependencies": [{"from": "app", "to": "libf"}],
+    })
+    aid_ok = a_ok["id"]
+    check(
+        "impact: baseline item A is ok",
+        a_ok["result"]["status"] == "ok"
+        and set(a_ok["result"]["artifact_obligations"])
+        == {"attribution", "source-offer", "same-license"}
+        and a_ok["result"]["adopted"]["libf"] == "F-1.0",
+    )
+
+    b_missing = assess({
+        "product": "b-missing",
+        "components": [{"id": "q", "license": "Q-1.0"}],
+    })
+    aid_missing = b_missing["id"]
+    check("impact: baseline item B is ok", b_missing["result"]["status"] == "ok")
+
+    c_conflict = assess({
+        "product": "c-conflict",
+        "components": [
+            {"id": "app", "license": "P-1.0"},
+            {"id": "x", "license": "X-1.0", "linkage": "static"},
+            {"id": "y", "license": "Y-1.0", "linkage": "static"},
+        ],
+        "dependencies": [
+            {"from": "app", "to": "x"},
+            {"from": "app", "to": "y"},
+        ],
+    })
+    aid_conflict = c_conflict["id"]
+    check("impact: baseline item C is conflict",
+          c_conflict["result"]["status"] == "conflict")
+
+    # target draft r2 based on r1 (stays a draft, never activated)
+    code, body = call("POST", "/v1/rulesets/impact/revisions",
+                      {"rules": v2, "base_revision": r1})
+    r2 = body.get("revision")
+    check("impact: target revision drafted",
+          code == 200 and body.get("active") is False and r2 != r1)
+
+    def review(ids, base=r1, target=r2, ruleset="impact"):
+        return call(
+            "POST",
+            "/v1/rulesets/%s/revisions/%s/impact-review" % (ruleset, target),
+            {"base_revision": base, "assessment_ids": ids},
+        )
+
+    # -- envelope 400s -------------------------------------------------------
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/impact-review" % r2,
+        {"assessment_ids": [aid_ok]})
+    check("impact: missing base_revision -> 400", code == 400)
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/impact-review" % r2,
+        {"base_revision": 7, "assessment_ids": [aid_ok]})
+    check("impact: non-string base_revision -> 400", code == 400)
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/impact-review" % r2,
+        {"base_revision": r1})
+    check("impact: missing assessment_ids -> 400", code == 400)
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/impact-review" % r2,
+        {"base_revision": r1, "assessment_ids": []})
+    check("impact: empty assessment_ids -> 400", code == 400)
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/impact-review" % r2,
+        {"base_revision": r1, "assessment_ids": "nope"})
+    check("impact: non-array assessment_ids -> 400", code == 400)
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/impact-review" % r2,
+        {"base_revision": r1, "assessment_ids": [aid_ok, aid_ok]})
+    check("impact: duplicate assessment id -> 400", code == 400)
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/impact-review" % r2,
+        {"base_revision": r1, "assessment_ids": [42]})
+    check("impact: non-string assessment id -> 400", code == 400)
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/impact-review" % r2,
+        ["not", "an", "object"])
+    check("impact: non-object body -> 400", code == 400)
+
+    # 50 ids are accepted; 51 fail the envelope before any state check
+    fifty = []
+    for i in range(50):
+        out = assess({
+            "product": "bulk-%02d" % i,
+            "components": [{"id": "c%02d" % i, "license": "P-1.0"}],
+        })
+        fifty.append(out["id"])
+    code, bulk = review(fifty)
+    check(
+        "impact: batch of 50 accepted",
+        code == 200 and bulk.get("assessed_count") == 50
+        and [it["assessment_id"] for it in bulk["items"]] == sorted(fifty),
+    )
+    code, body = review(fifty + ["deadbeef" * 4])
+    check("impact: batch of 51 -> 400 (no state evaluation)", code == 400)
+
+    # -- happy-path report ---------------------------------------------------
+    batch = [aid_conflict, aid_missing, aid_ok]
+    code, rep = review(batch)
+    check("impact: mixed batch 200", code == 200, json.dumps(rep)[:200])
+    items = rep.get("items", [])
+    check(
+        "impact: items sorted by assessment id",
+        [it["assessment_id"] for it in items] == sorted(batch),
+    )
+    check(
+        "impact: header fields",
+        rep.get("ruleset") == "impact"
+        and rep.get("target_revision") == r2
+        and rep.get("base_revision") == r1
+        and rep.get("assessed_count") == 3
+        and len(rep.get("report_hash", "")) == 64,
+    )
+    by_id = {it["assessment_id"]: it for it in items}
+
+    it = by_id[aid_ok]
+    check(
+        "impact: ok->conflict regression projected",
+        it["old_status"] == "ok" and it["new_status"] == "conflict"
+        and it["old_summary_hash"] == a_ok["result"]["summary_hash"]
+        and it["new_summary_hash"] != it["old_summary_hash"]
+        and it["old_adopted"] == a_ok["result"]["adopted"]
+        and it["new_adopted"] is None
+        and it["regressed"] is True,
+        json.dumps(it)[:300],
+    )
+    od = it["obligation_diff"]
+    check(
+        "impact: obligation diff on regression",
+        set(od["artifact_obligations"]["removed"])
+        == {"attribution", "source-offer", "same-license"}
+        and od["artifact_obligations"]["added"] == []
+        and {d["component"] for d in od["components"]} == {"app", "libf"},
+        json.dumps(od)[:300],
+    )
+
+    it = by_id[aid_missing]
+    check(
+        "impact: ok->missing-rules regression projected",
+        it["old_status"] == "ok" and it["new_status"] == "missing-rules"
+        and it["old_adopted"] is not None and it["new_adopted"] is None
+        and it["regressed"] is True,
+    )
+
+    it = by_id[aid_conflict]
+    check(
+        "impact: conflict->conflict is not a regression",
+        it["old_status"] == "conflict" and it["new_status"] == "conflict"
+        and it["old_adopted"] is None and it["new_adopted"] is None
+        and it["regressed"] is False
+        and it["new_summary_hash"] == it["old_summary_hash"],
+    )
+
+    summary = rep["summary"]
+    check(
+        "impact: regression summary",
+        summary["release_to_conflict"] == [aid_ok]
+        and summary["release_to_error"] == [aid_missing]
+        and summary["release_to_conflict_or_error"]
+        == sorted([aid_ok, aid_missing])
+        and summary["release_to_conflict_or_error_count"] == 2,
+        json.dumps(summary)[:300],
+    )
+    transitions = {(c["from"], c["to"]): c["count"]
+                    for c in summary["status_changes"]}
+    check(
+        "impact: status change counters",
+        transitions == {("ok", "conflict"): 1, ("ok", "missing-rules"): 1}
+        and summary["status_changed_count"] == 2,
+    )
+
+    # each new result is exactly the target-snapshot re-evaluation
+    for aid, label in (
+        (aid_ok, "a-ok"),
+        (aid_missing, "b-missing"),
+        (aid_conflict, "c-conflict"),
+    ):
+        row = call("GET", "/v1/assessments/" + aid)[1]
+        recomputed = assess_normalized(row["request"], validate_ruleset(v2))
+        check(
+            "impact: new_summary_hash matches independent re-evaluation (%s)"
+            % label,
+            by_id[aid]["new_summary_hash"] == recomputed["summary_hash"]
+            and by_id[aid]["new_status"] == recomputed["status"],
+        )
+
+    # request ordering must not change the report
+    code, rep_rev = review(list(reversed(batch)))
+    check(
+        "impact: request order does not change report/hash",
+        code == 200 and rep_rev["report_hash"] == rep["report_hash"]
+        and [i["assessment_id"] for i in rep_rev["items"]]
+        == [i["assessment_id"] for i in rep["items"]],
+    )
+    code, rep_again = review(batch)
+    check(
+        "impact: repeat review is byte-stable",
+        code == 200 and json.dumps(rep_again, sort_keys=True)
+        == json.dumps(rep, sort_keys=True),
+    )
+
+    # -- whole-batch 409s, no partial reports --------------------------------
+    code, body = review([aid_ok], base="0" * 16)
+    check(
+        "impact: stale baseline -> 409 active-moved",
+        code == 409 and body.get("reason") == "active-moved"
+        and body.get("base_revision") == "0" * 16
+        and body.get("active_revision") == r1,
+        json.dumps(body)[:200],
+    )
+    code, body = review([aid_ok], base=None)
+    check("impact: null baseline against active ruleset -> 409",
+          code == 409 and body.get("reason") == "active-moved")
+    code, body = review([aid_ok], target="a" * 16)
+    check(
+        "impact: unknown target revision -> 409",
+        code == 409 and body.get("reason") == "unknown-target-revision"
+        and body.get("active_revision") == r1,
+    )
+    code, body = review(
+        [aid_ok], target="0" * 16, ruleset="impact-never-existed"
+    )
+    check("impact: unknown ruleset -> 409 ruleset-not-found",
+          code == 409 and body.get("reason") == "ruleset-not-found")
+    code, body = review(["1" * 32])
+    check(
+        "impact: unknown assessment -> 409 assessment-not-found",
+        code == 409 and body.get("reason") == "assessment-not-found"
+        and body.get("assessment_ids") == ["1" * 32],
+    )
+    code, body = review(["z" * 32, "a" * 32])
+    check(
+        "impact: unknown ids reported deterministically (sorted)",
+        code == 409 and body.get("assessment_ids") == ["a" * 32, "z" * 32],
+    )
+    # one bad id poisons the whole batch; no partial report exists
+    code, body = review([aid_ok, "2" * 32, aid_missing])
+    check("impact: one unknown id fails the whole batch",
+          code == 409 and body.get("reason") == "assessment-not-found"
+          and body.get("assessment_ids") == ["2" * 32])
+    code, clean = review([aid_ok, aid_missing])
+    check(
+        "impact: clean batch after refused batch still reports",
+        code == 200 and clean["assessed_count"] == 2
+        and {i["assessment_id"] for i in clean["items"]}
+        == {aid_ok, aid_missing}
+        and {i["new_summary_hash"] for i in clean["items"]}
+        == {i["new_summary_hash"] for i in rep["items"]
+            if i["assessment_id"] in (aid_ok, aid_missing)},
+    )
+
+    # foreign ruleset assessment
+    call("PUT", "/v1/rulesets/impact-other",
+         {"licenses": {"O-1.0": {"obligations": ["attribution"]}}})
+    foreign = call("POST", "/v1/assessments", {
+        "product": "foreign", "ruleset": "impact-other",
+        "components": [{"id": "o", "license": "O-1.0"}]})[1]
+    code, body = review([aid_ok, foreign["id"]])
+    check(
+        "impact: foreign-ruleset assessment -> 409 whole batch",
+        code == 409 and body.get("reason") == "assessment-ruleset-mismatch"
+        and body.get("ruleset") == "impact"
+        and body.get("assessment_ids") == [foreign["id"]],
+        json.dumps(body)[:200],
+    )
+    # inline-rule assessments belong to no ruleset and are refused too
+    inline = call("POST", "/v1/assessments", {
+        "product": "inline",
+        "rules": {"licenses": {"I-1.0": {"obligations": ["attribution"]}}},
+        "components": [{"id": "i", "license": "I-1.0"}]})[1]
+    code, body = review([inline["id"]])
+    check("impact: inline-rule assessment -> 409",
+          code == 409 and body.get("reason") == "assessment-ruleset-mismatch")
+
+    # -- revision mismatch after activation/rollback -------------------------
+    code, body = call("POST", "/v1/rulesets/impact/revisions",
+                      {"rules": v3, "base_revision": r1})
+    r3 = body["revision"]
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/activate" % r3,
+        {"expected_active_revision": r1})
+    check("impact: r3 activated for mismatch scenario", code == 200)
+    aid_r3 = assess({"product": "on-r3",
+                     "components": [{"id": "p3", "license": "P-1.0"}]})
+    check("impact: new assessment records r3",
+          aid_r3.get("ruleset_revision") == r3)
+    # roll back to r1: the r3-recorded assessment is now on the wrong revision
+    code, body = call(
+        "POST", "/v1/rulesets/impact/revisions/%s/activate" % r1,
+        {"expected_active_revision": r3})
+    check("impact: rolled back to r1", code == 200)
+    code, body = review([aid_ok, aid_r3["id"]])
+    check(
+        "impact: assessment recorded against another revision -> 409",
+        code == 409 and body.get("reason") == "assessment-revision-mismatch"
+        and body.get("active_revision") == r1
+        and body.get("assessment_ids") == [aid_r3["id"]],
+        json.dumps(body)[:200],
+    )
+    code, body = review([aid_r3["id"]], base=r3, target=r3)
+    check("impact: review prepared at r3 after rollback -> active-moved",
+          code == 409 and body.get("reason") == "active-moved"
+          and body.get("active_revision") == r1)
+
+    # draft-only ruleset: null baseline passes the active-match stage; a
+    # nonexistent id then fails at assessment lookup (not at the baseline)
+    code, body = call("POST", "/v1/rulesets/impact-draft/revisions",
+                      {"rules": {"licenses": {"S-1.0": {}}},
+                       "base_revision": None})
+    rdraft = body["revision"]
+    code, body = call(
+        "POST",
+        "/v1/rulesets/impact-draft/revisions/%s/impact-review" % rdraft,
+        {"base_revision": None, "assessment_ids": ["9" * 32]})
+    check(
+        "impact: draft-only ruleset accepts null baseline, then 409 on id",
+        code == 409 and body.get("reason") == "assessment-not-found",
+        json.dumps(body)[:160],
+    )
+
+    # reviewing the already-active revision against itself changes nothing
+    code, self_rep = review([aid_ok], target=r1)
+    sit = {i["assessment_id"]: i for i in self_rep["items"]}[aid_ok]
+    check(
+        "impact: reviewing active revision against itself is a no-op diff",
+        code == 200 and sit["old_status"] == sit["new_status"]
+        and sit["old_summary_hash"] == sit["new_summary_hash"]
+        and sit["regressed"] is False
+        and self_rep["summary"]["status_changed_count"] == 0,
+    )
+
+    # -- read-only: review never mutates persisted state ---------------------
+    row = call("GET", "/v1/assessments/" + aid_ok)[1]
+    check(
+        "impact: review does not mutate the assessment",
+        row["revision"] == r1
+        and row["result"]["summary_hash"] == a_ok["result"]["summary_hash"],
+    )
+    hist = call("GET", "/v1/rulesets/impact/revisions")[1]
+    check(
+        "impact: review creates no revisions or activations",
+        [r["revision"] for r in hist["revisions"]] == [r1, r2, r3]
+        and hist["active_revision"] == r1,
+    )
+
+    # -- real race: reviews interleaved with activations are all-or-nothing -
+    race = {"codes": []}
+
+    def hammer_reviews():
+        for _ in range(60):
+            c, b = review([aid_ok])
+            # every outcome is either a valid 200 report or a 409 baseline
+            # conflict -- never a partial/500 answer
+            if c == 200:
+                assert b["assessed_count"] == 1 and b["base_revision"] == r1
+                assert b["items"][0]["old_status"] == "ok"
+            else:
+                assert c == 409 and b.get("reason") == "active-moved", b
+            race["codes"].append(c)
+
+    def toggle_activation():
+        for _ in range(15):
+            call("POST", "/v1/rulesets/impact/revisions/%s/activate" % r3,
+                 {"expected_active_revision": r1})
+            call("POST", "/v1/rulesets/impact/revisions/%s/activate" % r1,
+                 {"expected_active_revision": r3})
+
+    th1 = threading.Thread(target=hammer_reviews)
+    th2 = threading.Thread(target=toggle_activation)
+    th1.start(); th2.start(); th1.join(); th2.join()
+    check(
+        "impact: racing reviews are 200-consistent or 409, never partial",
+        set(race["codes"]) <= {200, 409} and 200 in race["codes"],
+        str(sorted(set(race["codes"]))),
+    )
+    # leave the ruleset back on r1 and r1-recorded reviews still working
+    call("POST", "/v1/rulesets/impact/revisions/%s/activate" % r1,
+         {"expected_active_revision": r3})
+    code, body = review([aid_ok, aid_missing, aid_conflict])
+    check("impact: report identical after activation churn",
+          code == 200 and body["report_hash"] == rep["report_hash"])
+
+
+def run_release_batch_checks():
+    """Exercise immutable release batch registration end to end.
+
+    A dedicated ruleset backs ok assessments that share one component
+    (deduplicated at merge time) and differ in distribution so the
+    merged obligation union is observable.  Checks cover: manifest
+    content/order, artifact and component dedup with merged obligation
+    unions, entry-order invariance of batch_hash, locked rule revision
+    provenance, idempotent re-registration (same content, any order),
+    409 batch_id reuse with different content, envelope 400s, 409s
+    (unknown/non-ok assessment, shared-component disagreement), 422s
+    (unverifiable inline snapshot, unknown artifact, version mismatch,
+    unknown/self dependency), no partial rows on failure, persistence of
+    the snapshot after a later rules publication, and GET of the batch.
+    """
+    rules = {
+        "licenses": {
+            "B-MIT": {"obligations": ["attribution", "license-text"]},
+            "B-GPL": {
+                "obligations": ["attribution", "license-text", "source-offer"],
+                "propagates": ["static"],
+            },
+            "B-ISC": {"obligations": ["attribution"]},
+        },
+        "obligation_scopes": {"source-offer": ["binary", "source"]},
+    }
+    code, body = call("PUT", "/v1/rulesets/relbatch", rules)
+    check("batch: ruleset published", code == 200 and body.get("created") is True)
+    r1 = call("GET", "/v1/rulesets/relbatch")[1]["active_revision"]
+
+    def assess(spec):
+        code, out = call("POST", "/v1/assessments",
+                         dict({"ruleset": "relbatch"}, **spec))
+        check("batch: assessment accepted (%s)" % spec["product"], code == 200,
+              json.dumps(out)[:160])
+        return out
+
+    a1 = assess({
+        "product": "prod-a", "distribution": "binary",
+        "components": [
+            {"id": "art-a", "name": "Artifact A", "version": "1.0.0",
+             "license": "B-MIT"},
+            {"id": "common", "name": "Common Kit", "version": "2.3.1",
+             "license": "B-GPL", "linkage": "dynamic"},
+        ],
+        "dependencies": [{"from": "art-a", "to": "common"}],
+    })
+    aid1 = a1["id"]
+    a2 = assess({
+        "product": "prod-b", "distribution": "saas",
+        "components": [
+            {"id": "art-b", "name": "Artifact B", "version": "0.9.0",
+             "license": "B-ISC"},
+            {"id": "common", "name": "Common Kit", "version": "2.3.1",
+             "license": "B-GPL", "linkage": "dynamic"},
+        ],
+        "dependencies": [{"from": "art-b", "to": "common"}],
+    })
+    aid2 = a2["id"]
+    # shared component whose name/version disagree -> merge conflict
+    a3 = assess({
+        "product": "prod-c",
+        "components": [
+            {"id": "art-c", "name": "Artifact C", "version": "5",
+             "license": "B-MIT"},
+            {"id": "common", "name": "Common Fork", "version": "9.9.9",
+             "license": "B-GPL", "linkage": "dynamic"},
+        ],
+    })
+    aid3 = a3["id"]
+    # an inline-rules assessment (no pinned revision) for rejection
+    code, inline = call("POST", "/v1/assessments", {
+        "components": [{"id": "inl", "name": "Inl", "version": "1",
+                        "license": "B-MIT"}],
+        "rules": {"licenses": {"B-MIT": {"obligations": ["attribution"]}}},
+    })
+    inline_id = inline["id"]
+    check("batch: inline assessment ok", code == 200
+          and inline["result"]["status"] == "ok")
+
+    def entry(aid, cid, ver, deps=None):
+        e = {"assessment_id": aid, "id": cid, "version": ver}
+        if deps is not None:
+            e["dependencies"] = deps
+        return e
+
+    def register(bid, entries):
+        return call("POST", "/v1/release-batches",
+                    {"batch_id": bid, "entries": entries})
+
+    # -- envelope 400s -------------------------------------------------------
+    code, _ = register("env", [])
+    check("batch: empty entries -> 400", code == 400)
+    code, _ = register("env", [
+        {"assessment_id": "x", "id": "i%d" % i, "version": "1"}
+        for i in range(51)
+    ])
+    check("batch: 51 entries -> 400", code == 400)
+    for bad in [
+        {"entries": [entry(aid1, "art-a", "1.0.0")]},  # missing batch_id
+        {"batch_id": "", "entries": [entry(aid1, "art-a", "1.0.0")]},
+        {"batch_id": 17, "entries": [entry(aid1, "art-a", "1.0.0")]},
+        {"batch_id": "env", "entries": "nope"},
+        {"batch_id": "env", "entries": [{"id": "x", "version": "1"}]},
+        {"batch_id": "env", "entries": [entry(aid1, "art-a", "")]},
+        {"batch_id": "env", "entries": [entry(aid1, "art-a", "1", deps=["x", "x"])]},
+        {"batch_id": "env", "entries": [entry(aid1, "art-a", "1"),
+                                        entry(aid2, "art-a", "0.9.0")]},
+        ["not", "an", "object"],
+    ]:
+        code, b = call("POST", "/v1/release-batches", bad)
+        check("batch: envelope rejection -> 400 (%r)" % json.dumps(bad)[:60],
+              code == 400)
+
+    # -- happy path ----------------------------------------------------------
+    entries = [
+        entry(aid1, "art-a", "1.0.0", ["common"]),
+        entry(aid2, "art-b", "0.9.0", ["common"]),
+    ]
+    code, batch = register("rel-001", entries)
+    check("batch: register 200 created", code == 200 and batch.get("created") is True,
+          json.dumps(batch)[:200])
+    check("batch: artifacts merged, sorted by id",
+          [a["id"] for a in batch.get("artifacts", [])] == ["art-a", "art-b"])
+    arts = {a["id"]: a for a in batch["artifacts"]}
+    check(
+        "batch: artifact identity/version/license/deps pinned",
+        arts["art-a"]["version"] == "1.0.0"
+        and arts["art-a"]["license"] == "B-MIT"
+        and arts["art-a"]["dependencies"] == ["common"]
+        and arts["art-a"]["assessment_id"] == aid1
+        and arts["art-b"]["license"] == "B-ISC"
+        and arts["art-b"]["assessment_id"] == aid2,
+    )
+    comps = {c["id"]: c for c in batch.get("components", [])}
+    check(
+        "batch: shared component deduplicated once",
+        sorted(comps) == ["art-a", "art-b", "common"]
+        and comps["common"]["assessments"] == sorted([aid1, aid2])
+        and comps["common"]["version"] == "2.3.1"
+        and comps["common"]["license"] == "B-GPL",
+    )
+    # common is B-GPL (source-offer gated out under saas in assessment 2):
+    # the union over both assessments restores the binary-scope obligation.
+    check(
+        "batch: component obligations merged (union across assessments)",
+        comps["common"]["obligations"]
+        == ["attribution", "license-text", "source-offer"],
+        str(comps["common"]["obligations"]),
+    )
+    check("batch: batch_hash is sha256",
+          len(batch.get("batch_hash", "")) == 64)
+    check(
+        "batch: per-artifact and union artifact obligations",
+        arts["art-a"]["obligations"]
+        == ["attribution", "license-text", "source-offer"]
+        and arts["art-b"]["obligations"] == ["attribution", "license-text"]
+        and batch.get("artifact_obligations")
+        == ["attribution", "license-text", "source-offer"],
+        str((arts["art-a"].get("obligations"), arts["art-b"].get("obligations"),
+             batch.get("artifact_obligations"))),
+    )
+    revs = {(r["assessment_id"]): r for r in batch.get("rule_revisions", [])}
+    check(
+        "batch: locked rule revisions recorded",
+        set(revs) == {aid1, aid2}
+        and all(r["ruleset"] == "relbatch" and r["revision"] == r1
+                and len(r["rules_hash"]) == 64 for r in revs.values()),
+        str(batch.get("rule_revisions")),
+    )
+
+    # -- order invariance + idempotency --------------------------------------
+    code, batch_rev = register("rel-001", list(reversed(entries)))
+    check(
+        "batch: same content, reversed entries -> idempotent, same hash",
+        code == 200 and batch_rev.get("created") is False
+        and batch_rev["batch_hash"] == batch["batch_hash"]
+        and batch_rev["artifacts"] == batch["artifacts"]
+        and batch_rev["components"] == batch["components"],
+    )
+    code, b = register("rel-001", [entry(aid1, "art-a", "1.0.0", ["common"])])
+    check("batch: same batch_id, different content -> 409",
+          code == 409 and b.get("reason") == "batch-id-reused"
+          and b.get("registered_batch_hash") == batch["batch_hash"])
+
+    # -- GET -----------------------------------------------------------------
+    code, got = call("GET", "/v1/release-batches/rel-001")
+    check("batch: GET returns the immutable manifest",
+          code == 200 and got.get("batch_hash") == batch["batch_hash"]
+          and "created" not in got)
+    code, b = call("GET", "/v1/release-batches/no-such-batch")
+    check("batch: GET unknown -> 404", code == 404)
+
+    # -- stateful rejections --------------------------------------------------
+    code, b = register("rel-missing",
+                       [entry("deadbeef" * 4, "x", "1")])
+    check("batch: unknown assessment -> 409",
+          code == 409 and b.get("reason") == "assessment-not-found"
+          and b.get("assessment_ids") == ["deadbeef" * 4])
+    code, b = register("rel-conflict",
+                       [entry(aid1, "art-a", "1.0.0"),
+                        entry(aid3, "art-c", "5")])
+    check("batch: shared component disagreement -> 409",
+          code == 409 and b.get("reason") == "component-conflict"
+          and b.get("component") == "common" and b.get("field") in
+          ("name", "version"))
+    code, b = register("rel-inline", [entry(inline_id, "inl", "1")])
+    check("batch: unverifiable inline snapshot -> 422", code == 422)
+    code, b = register("rel-no-art", [entry(aid1, "ghost", "1")])
+    check("batch: artifact not in snapshot -> 422", code == 422)
+    code, b = register("rel-bad-ver",
+                       [entry(aid1, "art-a", "9.9.9")])
+    check("batch: version mismatch -> 422", code == 422)
+    code, b = register("rel-bad-dep",
+                       [entry(aid1, "art-a", "1.0.0", ["nope"])])
+    check("batch: unknown dependency -> 422", code == 422)
+    code, b = register("rel-self-dep",
+                       [entry(aid1, "art-a", "1.0.0", ["art-a"])])
+    check("batch: self dependency -> 422", code == 422)
+
+    # one assessment may publish several artifacts (dependency as artifact)
+    code, b = register("rel-multi", [
+        entry(aid1, "art-a", "1.0.0", ["common"]),
+        entry(aid1, "common", "2.3.1", []),
+    ])
+    check(
+        "batch: multiple artifacts from one assessment merged",
+        code == 200 and [a["id"] for a in b["artifacts"]] == ["art-a", "common"]
+        and {c["id"]: c["assessments"] for c in b["components"]}["common"]
+        == [aid1]
+        and len(b["rule_revisions"]) == 1,
+        json.dumps(b)[:200],
+    )
+
+    # -- non-ok assessment: publish an incompatible revision first -----------
+    v2 = {
+        "licenses": dict(
+            rules["licenses"],
+            **{"B-MIT": {
+                "obligations": ["attribution", "license-text"],
+                "incompatible_with": ["B-GPL"],
+            }},
+        ),
+        "obligation_scopes": rules["obligation_scopes"],
+    }
+    code, rev = call("POST", "/v1/rulesets/relbatch/revisions",
+                     {"rules": v2, "base_revision": r1})
+    r2 = rev.get("revision")
+    code, _ = call("POST", "/v1/rulesets/relbatch/revisions/%s/activate" % r2,
+                   {"expected_active_revision": r1})
+    check("batch: incompatible revision published", code == 200)
+    # the pre-existing assessment, re-submitted now, records r2 and conflicts
+    ac2 = assess({
+        "product": "prod-conflict",
+        "components": [
+            {"id": "gpl", "license": "B-GPL", "linkage": "static"},
+            {"id": "mit", "license": "B-MIT", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "gpl", "to": "mit"}],
+    })
+    check("batch: new assessment against r2 is conflict",
+          ac2["result"]["status"] == "conflict"
+          and ac2.get("ruleset_revision") == r2)
+    code, b = register("rel-not-ok", [entry(ac2["id"], "gpl", "1")])
+    check("batch: non-ok assessment -> 409",
+          code == 409 and b.get("reason") == "assessment-not-ok"
+          and b.get("status") == "conflict")
+
+    # -- later rule publication must not change the registered snapshot -------
+    code, got = call("GET", "/v1/release-batches/rel-001")
+    check(
+        "batch: registered snapshot immutable after later publication",
+        code == 200
+        and got["batch_hash"] == batch["batch_hash"]
+        and {r["revision"] for r in got["rule_revisions"]} == {r1}
+        and got["components"] == batch["components"],
+    )
+
+    # -- no partial writes: only the one successful batch is stored ----------
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        stored = sorted(r[0] for r in conn.execute(
+            "SELECT batch_id FROM release_batches"))
+        counts = dict(conn.execute(
+            "SELECT batch_id, COUNT(*) FROM release_batch_items GROUP BY batch_id"))
+    finally:
+        conn.close()
+    check("batch: failed registrations wrote no rows",
+          stored == ["rel-001", "rel-multi"]
+          and counts == {"rel-001": 2, "rel-multi": 2},
+          "%s %s" % (stored, counts))
+
+
+def run_batch_snapshot_checks():
+    """End-to-end checks for POST /v1/release-batches/{id}/fulfillment-snapshot.
+
+    A two-artifact batch (one shared component deduplicated once) backs a
+    snapshot that mixes satisfied / overdue / pending instances, joint
+    ``all`` evidence, product-vs-component material scope, deadline
+    tightening over depends_on, timezone-date material windows,
+    due-on-deadline not overdue, late materials reported on gaps,
+    order-independent snapshot_hash, 404 on an unknown batch and whole
+    422s (never partial results) for invalid scheduling or evidence.
+    """
+    rules = {
+        "licenses": {
+            "S-MIT": {"obligations": ["attribution", "license-text"]},
+            "S-GPL": {
+                "obligations": ["attribution", "license-text", "source-offer"],
+                "propagates": ["static"],
+            },
+            "S-ISC": {"obligations": ["attribution"]},
+        },
+        "obligation_scopes": {"source-offer": ["binary", "source"]},
+    }
+    code, _ = call("PUT", "/v1/rulesets/snaprel", rules)
+    check("snapshot: ruleset published", code == 200)
+
+    def assess(spec):
+        code, out = call("POST", "/v1/assessments",
+                         dict({"ruleset": "snaprel"}, **spec))
+        check("snapshot: assessment ok (%s)" % spec["product"], code == 200,
+              json.dumps(out)[:160])
+        return out["id"]
+
+    aid1 = assess({
+        "product": "snap-a", "distribution": "binary",
+        "components": [
+            {"id": "art-a", "name": "Artifact A", "version": "1.0.0",
+             "license": "S-MIT"},
+            {"id": "common", "name": "Common Kit", "version": "2.3.1",
+             "license": "S-GPL", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "art-a", "to": "common"}],
+    })
+    aid2 = assess({
+        "product": "snap-b", "distribution": "binary",
+        "components": [
+            {"id": "art-b", "name": "Artifact B", "version": "0.9.0",
+             "license": "S-ISC"},
+            {"id": "common", "name": "Common Kit", "version": "2.3.1",
+             "license": "S-GPL", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "art-b", "to": "common"}],
+    })
+    code, batch = call("POST", "/v1/release-batches", {
+        "batch_id": "snap-rel-1",
+        "entries": [
+            {"assessment_id": aid1, "id": "art-a", "version": "1.0.0",
+             "dependencies": ["common"]},
+            {"assessment_id": aid2, "id": "art-b", "version": "0.9.0",
+             "dependencies": ["common"]},
+        ],
+    })
+    check("snapshot: batch registered", code == 200
+          and batch.get("created") is True, json.dumps(batch)[:200])
+    batch_hash = batch["batch_hash"]
+
+    # release Fri 2026-09-25 (Asia/Shanghai); now Sat 2026-10-10.
+    # attribution: 30 calendar days -> 10-25 (not yet due)
+    # license-text: 20 calendar days -> 10-15, tightened to source-offer
+    # source-offer: 5 business days (Sep 28/29/30, Oct 5/6, skipping the
+    #               Oct 1/2 holidays and weekends) -> 10-06 (already past)
+    def snapshot_body(now="2026-10-10T12:00:00+08:00"):
+        return {
+            "batch_id": "snap-rel-1",
+            "now": now,
+            "release_at": "2026-09-25T16:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+            "workdays": [1, 2, 3, 4, 5],
+            "holidays": ["2026-10-01", "2026-10-02"],
+            "obligations": {
+                "attribution": {"offset": 30, "unit": "calendar_day",
+                                "depends_on": []},
+                "license-text": {"offset": 20, "unit": "calendar_day",
+                                 "depends_on": []},
+                "source-offer": {"offset": 5, "unit": "business_day",
+                                 "depends_on": ["license-text"]},
+            },
+            "materials": [
+                {"id": "product-notice", "digest": "sha256:aaa",
+                 "type": "notice", "scope": "product",
+                 "provided_at": "2026-09-26T10:00:00+08:00"},
+                {"id": "common-copy", "digest": "sha256:bbb",
+                 "type": "license-copy", "scope": "component",
+                 "component": "common",
+                 "provided_at": "2026-09-27T10:00:00+08:00"},
+                {"id": "arta-copy", "digest": "sha256:ccc",
+                 "type": "license-copy", "scope": "component",
+                 "component": "art-a",
+                 "provided_at": "2026-09-27T10:00:00+08:00"},
+                {"id": "common-source-late", "digest": "sha256:ddd",
+                 "type": "source-archive", "scope": "component",
+                 "component": "common",
+                 "provided_at": "2026-10-08T10:00:00+08:00"},
+            ],
+            "rules": {"obligations": {
+                "attribution": {"type": "notice"},
+                "license-text": {"all": [
+                    {"type": "notice"},
+                    {"any": [{"type": "license-copy"},
+                             {"type": "license-bundle"}]},
+                ]},
+                "source-offer": {"all": [
+                    {"type": "source-archive"}, {"scope": "component"},
+                ]},
+            }},
+        }
+
+    code, snap = call("POST",
+                      "/v1/release-batches/snap-rel-1/fulfillment-snapshot",
+                      snapshot_body())
+    check("snapshot: 200", code == 200, json.dumps(snap)[:300])
+    check("snapshot: batch hash echoed", snap.get("batch_hash") == batch_hash)
+
+    sched = {i["obligation"]: i for i in snap.get("schedule", [])}
+    check(
+        "snapshot: raw/final deadlines computed and tightened by depends_on",
+        sched["source-offer"]["raw_deadline"] == "2026-10-06"
+        and sched["license-text"]["raw_deadline"] == "2026-10-15"
+        and sched["license-text"]["deadline"] == "2026-10-06"
+        and sched["license-text"]["tightening_chain"]
+        == ["license-text", "source-offer"]
+        and sched["attribution"]["deadline"] == "2026-10-25",
+        json.dumps(sched)[:300],
+    )
+
+    inst = {(i["component"], i["obligation"]): i for i in snap.get("instances", [])}
+    # exactly one instance per merged (component, obligation): common once
+    check(
+        "snapshot: shared component counted once; full instance set",
+        sorted((c, o) for c, o in inst) == sorted([
+            ("art-a", "attribution"), ("art-a", "license-text"),
+            ("art-b", "attribution"),
+            ("common", "attribution"), ("common", "license-text"),
+            ("common", "source-offer"),
+        ]),
+        str(sorted(inst)),
+    )
+    check(
+        "snapshot: satisfied / overdue / pending statuses",
+        inst[("art-a", "attribution")]["status"] == "satisfied"
+        and inst[("art-b", "attribution")]["status"] == "satisfied"
+        and inst[("common", "attribution")]["status"] == "satisfied"
+        and inst[("art-a", "license-text")]["status"] == "satisfied"
+        and inst[("common", "license-text")]["status"] == "satisfied"
+        and inst[("common", "source-offer")]["status"] == "overdue",
+        json.dumps(snap["instances"])[:400],
+    )
+    # joint all: product notice + component copies together satisfy
+    check(
+        "snapshot: multiple materials jointly satisfy all",
+        inst[("art-a", "license-text")]["satisfied_by"]
+        == ["arta-copy", "product-notice"]
+        and inst[("common", "license-text")]["satisfied_by"]
+        == ["common-copy", "product-notice"],
+        json.dumps(inst[("art-a", "license-text")]),
+    )
+    # a component-scoped copy never covers another component; art-b has no
+    # license-text obligation itself, but product notice alone is not enough
+    # for the all at art-a when the art-a copy is missing (checked below)
+    # common-copy (component-scoped, in window) already matches the
+    # scope=component conjunct, so the gap is incomplete evidence with only
+    # the source-archive leaf unmatched; the later source archive is reported
+    # as late (provided 10-08, after the 10-06 deadline)
+    gap = inst[("common", "source-offer")]["gaps"][0]
+    check(
+        "snapshot: overdue gap reports missing leaf, candidates and late",
+        gap["reason"] == "incomplete-evidence"
+        and gap["missing_leaves"] == [{"type": "source-archive"}]
+        and gap["candidate_materials"] == ["common-copy"]
+        and gap["late_materials"] == ["common-source-late"],
+        json.dumps(gap),
+    )
+    check(
+        "snapshot: summary counts",
+        snap.get("summary") == {
+            "total": 6, "satisfied": 5, "overdue": 1, "pending": 0},
+        str(snap.get("summary")),
+    )
+
+    # due exactly on the deadline date must NOT be overdue; source-offer is
+    # unsatisfied but its 10-06 deadline is still open on 10-06
+    code, due = call("POST",
+                     "/v1/release-batches/snap-rel-1/fulfillment-snapshot",
+                     snapshot_body(now="2026-10-06T23:59:00+08:00"))
+    di = {(i["component"], i["obligation"]): i for i in due["instances"]}
+    dgap = di[("common", "source-offer")]["gaps"][0]
+    check("snapshot: due-on-deadline is pending, never overdue",
+          code == 200
+          and di[("common", "source-offer")]["status"] == "pending"
+          and dgap["reason"] == "incomplete-evidence"
+          and dgap["candidate_materials"] == ["common-copy"]
+          and dgap["missing_leaves"] == [{"type": "source-archive"}])
+    # the late source (provided 10-08) is still after the 10-06 deadline
+    check("snapshot: due-on-deadline gap marks future material late",
+          dgap["late_materials"] == ["common-source-late"])
+
+    # a material provided ON the deadline date is inside the window
+    on_time = snapshot_body()
+    on_time["materials"][3]["provided_at"] = "2026-10-06T09:00:00+08:00"
+    code, ok = call("POST",
+                    "/v1/release-batches/snap-rel-1/fulfillment-snapshot",
+                    on_time)
+    oi = {(i["component"], i["obligation"]): i for i in ok["instances"]}
+    check(
+        "snapshot: provided-on-deadline material satisfies (date window)",
+        code == 200
+        and oi[("common", "source-offer")]["status"] == "satisfied"
+        and oi[("common", "source-offer")]["satisfied_by"]
+        == ["common-copy", "common-source-late"]
+        and ok["summary"] == {"total": 6, "satisfied": 6,
+                              "overdue": 0, "pending": 0},
+        json.dumps(oi[("common", "source-offer")]),
+    )
+
+    # component scope: removing art-a's copy makes art-a license-text
+    # incomplete; common is unaffected by the art-a copy
+    no_arta = snapshot_body()
+    no_arta["materials"] = [
+        m for m in no_arta["materials"] if m["id"] != "arta-copy"
+    ]
+    code, miss = call("POST",
+                      "/v1/release-batches/snap-rel-1/fulfillment-snapshot",
+                      no_arta)
+    mi = {(i["component"], i["obligation"]): i for i in miss["instances"]}
+    # 10-03 is before the tightened 10-06 license-text deadline -> pending
+    agap = mi[("art-a", "license-text")]["gaps"][0]
+    check(
+        "snapshot: component material covers only its component; overdue gap",
+        mi[("art-a", "license-text")]["status"] == "overdue"
+        and agap["reason"] == "incomplete-evidence"
+        and agap["candidate_materials"] == ["product-notice"]
+        and agap["missing_leaves"] == [
+            {"type": "license-bundle"}, {"type": "license-copy"}],
+        json.dumps(agap),
+    )
+    check(
+        "snapshot: other components unaffected",
+        mi[("common", "license-text")]["status"] == "satisfied"
+        and mi[("art-b", "attribution")]["status"] == "satisfied",
+    )
+
+    # missing evidence rule for one obligation: all instances overdue/pending
+    no_rules = snapshot_body()
+    no_rules["rules"]["obligations"].pop("source-offer")
+    code, nr = call("POST",
+                    "/v1/release-batches/snap-rel-1/fulfillment-snapshot",
+                    no_rules)
+    ni = {(i["component"], i["obligation"]): i for i in nr["instances"]}
+    check(
+        "snapshot: missing evidence rule -> never satisfied, reason reported",
+        code == 200
+        and ni[("common", "source-offer")]["status"] == "overdue"
+        and ni[("common", "source-offer")]["gaps"][0]["reason"]
+        == "no-evidence-rule",
+    )
+
+    # order invariance: shuffle materials, object keys, workdays, holidays
+    perm = snapshot_body()
+    perm["materials"] = list(reversed(perm["materials"]))
+    perm["workdays"] = [5, 4, 3, 2, 1]
+    perm["holidays"] = ["2026-10-02", "2026-10-01"]
+    perm["obligations"] = {
+        "source-offer": {"depends_on": ["license-text"], "unit": "business_day",
+                         "offset": 5},
+        "attribution": {"depends_on": [], "unit": "calendar_day", "offset": 30},
+        "license-text": {"depends_on": [], "unit": "calendar_day", "offset": 20},
+    }
+    code, perm_out = call(
+        "POST", "/v1/release-batches/snap-rel-1/fulfillment-snapshot", perm)
+    check("snapshot: request order does not change snapshot_hash",
+          code == 200 and perm_out["snapshot_hash"] == snap["snapshot_hash"],
+          "%s vs %s" % (perm_out.get("snapshot_hash"),
+                        snap.get("snapshot_hash")))
+    check("snapshot: hash is sha256", len(snap.get("snapshot_hash", "")) == 64)
+
+    # same instant written in UTC lands on the same local dates/hash
+    utc_body = dict(snapshot_body(),
+                    release_at="2026-09-25T08:00:00Z",
+                    now="2026-10-10T04:00:00Z")
+    code, utc_out = call(
+        "POST", "/v1/release-batches/snap-rel-1/fulfillment-snapshot", utc_body)
+    check("snapshot: equivalent instants normalize to same hash",
+          code == 200 and utc_out["snapshot_hash"] == snap["snapshot_hash"])
+
+    # 404: unknown batch
+    code, b = call("POST",
+                   "/v1/release-batches/no-such-batch/fulfillment-snapshot",
+                   snapshot_body())
+    check("snapshot: unknown batch -> 404", code == 404)
+
+    # 400: non-object envelope
+    code, _ = call("POST",
+                   "/v1/release-batches/snap-rel-1/fulfillment-snapshot", ["x"])
+    check("snapshot: non-object body -> 400", code == 400)
+
+    # 422: every invalid scheduling/evidence case fails whole, no partial
+    def mutate(fn):
+        b2 = json.loads(json.dumps(snapshot_body()))
+        fn(b2)
+        return b2
+
+    def cycle(b2):
+        b2["obligations"]["license-text"]["depends_on"] = ["source-offer"]
+
+    invalid = [
+        ("batch id mismatch",
+         mutate(lambda b2: b2.update(batch_id="other-batch"))),
+        ("missing obligation rule",
+         mutate(lambda b2: b2["obligations"].pop("attribution"))),
+        ("unknown timezone", mutate(lambda b2: b2.update(timezone="Mars/Olympus"))),
+        ("bad now", mutate(lambda b2: b2.update(now="2026-10-03 12:00"))),
+        ("bad release_at",
+         mutate(lambda b2: b2.update(release_at="2026-09-25T16:00:00"))),
+        ("bad holiday", mutate(lambda b2: b2.update(holidays=["10/1/2026"]))),
+        ("bad workday", mutate(lambda b2: b2.update(workdays=[0, 1]))),
+        ("bad unit",
+         mutate(lambda b2: b2["obligations"]["attribution"].update(unit="week"))),
+        ("negative offset",
+         mutate(lambda b2: b2["obligations"]["attribution"].update(offset=-1))),
+        ("dangling depends_on",
+         mutate(lambda b2: b2["obligations"]["attribution"]
+                .update(depends_on=["ghost"]))),
+        ("dependency cycle", mutate(cycle)),
+        ("bad provided_at",
+         mutate(lambda b2: b2["materials"][0].update(provided_at="yesterday"))),
+        ("duplicate material id",
+         mutate(lambda b2: b2["materials"].append(dict(b2["materials"][0])))),
+        ("product material with component",
+         mutate(lambda b2: b2["materials"][0].update(component="art-a"))),
+        ("material unknown component",
+         mutate(lambda b2: b2["materials"].append(
+             {"id": "x", "type": "notice", "scope": "component",
+              "component": "ghost", "provided_at": "2026-09-26T10:00:00Z"}))),
+        ("rule all and any together",
+         mutate(lambda b2: b2["rules"]["obligations"]["attribution"].update(
+             {"all": [{"type": "notice"}], "any": [{"type": "x"}]}))),
+        ("rule empty all",
+         mutate(lambda b2: b2["rules"]["obligations"]["attribution"]
+                .update({"all": []}))),
+        ("rule unknown component",
+         mutate(lambda b2: b2["rules"]["obligations"]["attribution"].update(
+             {"component": "ghost", "type": "notice"}))),
+        ("rule leaf without constraint",
+         mutate(lambda b2: b2["rules"]["obligations"]["attribution"]
+                .update({"componentx": "n"}))),
+        ("rules not object", mutate(lambda b2: b2.update(rules=[]))),
+    ]
+    for label, bad in invalid:
+        code, b2 = call(
+            "POST", "/v1/release-batches/snap-rel-1/fulfillment-snapshot", bad)
+        check("snapshot: 422 on %s" % label, code == 422
+              and "instances" not in b2 and "snapshot_hash" not in b2,
+              "%s -> %s %s" % (label, code, json.dumps(b2)[:120]))
+
+    # materials are optional: empty array still yields a complete snapshot
+    empty = snapshot_body()
+    empty["materials"] = []
+    code, eout = call(
+        "POST", "/v1/release-batches/snap-rel-1/fulfillment-snapshot", empty)
+    check("snapshot: no materials -> all unsatisfiable, complete snapshot",
+          code == 200 and eout["summary"]["satisfied"] == 0
+          and eout["summary"]["overdue"] == 3
+          and eout["summary"]["pending"] == 3
+          and len(eout["instances"]) == 6
+          and all(i["gaps"][0]["reason"] == "no-matching-material"
+                  for i in eout["instances"])
+          and bool(eout["snapshot_hash"]),
+          json.dumps(eout.get("summary", {})),
+    )
+
+
+def run_admission_attestation_checks():
+    """End-to-end checks for immutable batch admission attestations.
+
+    Covers: happy-path minting inside the write transaction (proof hash,
+    adopted rule revisions, embedded recomputed snapshot), idempotent
+    replay on identical normalized content -- including UTC instant
+    spellings and array/key reordering -- a different-content replay
+    conflicting with 409, refusal (and no stored record) on pending /
+    overdue / missing-evidence instances, expected batch hash mismatch,
+    unknown batch, whole-request 422s on invalid snapshot inputs, 400
+    envelope errors, GET without ``created`` and immutability after a
+    later rules revision is published.
+    """
+    path = "/v1/release-batches/att-rel-1/admission-attestation"
+    rules = {
+        "licenses": {
+            "A-MIT": {"obligations": ["attribution", "license-text"]},
+            "A-GPL": {
+                "obligations": ["attribution", "license-text", "source-offer"],
+                "propagates": ["static"],
+            },
+            "A-ISC": {"obligations": ["attribution"]},
+        },
+        "obligation_scopes": {"source-offer": ["binary", "source"]},
+    }
+    code, _ = call("PUT", "/v1/rulesets/attrel", rules)
+    check("attestation: ruleset published", code == 200)
+
+    def assess(spec):
+        code, out = call("POST", "/v1/assessments",
+                         dict({"ruleset": "attrel"}, **spec))
+        check("attestation: assessment ok (%s)" % spec["product"], code == 200,
+              json.dumps(out)[:160])
+        return out["id"]
+
+    aid1 = assess({
+        "product": "att-a", "distribution": "binary",
+        "components": [
+            {"id": "art-a", "name": "Artifact A", "version": "1.0.0",
+             "license": "A-MIT"},
+            {"id": "common", "name": "Common Kit", "version": "2.3.1",
+             "license": "A-GPL", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "art-a", "to": "common"}],
+    })
+    aid2 = assess({
+        "product": "att-b", "distribution": "binary",
+        "components": [
+            {"id": "art-b", "name": "Artifact B", "version": "0.9.0",
+             "license": "A-ISC"},
+            {"id": "common", "name": "Common Kit", "version": "2.3.1",
+             "license": "A-GPL", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "art-b", "to": "common"}],
+    })
+    code, batch = call("POST", "/v1/release-batches", {
+        "batch_id": "att-rel-1",
+        "entries": [
+            {"assessment_id": aid1, "id": "art-a", "version": "1.0.0",
+             "dependencies": ["common"]},
+            {"assessment_id": aid2, "id": "art-b", "version": "0.9.0",
+             "dependencies": ["common"]},
+        ],
+    })
+    check("attestation: batch registered", code == 200 and batch.get("created"),
+          json.dumps(batch)[:200])
+    batch_hash = batch["batch_hash"]
+    expected_rule_revisions = sorted(
+        (r["assessment_id"] for r in batch["rule_revisions"])
+    )
+
+    # release Fri 2026-09-25; deadlines: attribution 10-25, license-text
+    # tightened to source-offer 10-06 (5 business days skipping Oct 1/2).
+    def att_body(att_id="att-001", now="2026-10-01T12:00:00+08:00",
+                 materials=None):
+        mats = [
+            {"id": "product-notice", "digest": "sha256:aaa",
+             "type": "notice", "scope": "product",
+             "provided_at": "2026-09-26T10:00:00+08:00"},
+            {"id": "common-copy", "digest": "sha256:bbb",
+             "type": "license-copy", "scope": "component",
+             "component": "common",
+             "provided_at": "2026-09-27T10:00:00+08:00"},
+            {"id": "arta-copy", "digest": "sha256:ccc",
+             "type": "license-copy", "scope": "component",
+             "component": "art-a",
+             "provided_at": "2026-09-27T10:00:00+08:00"},
+            {"id": "common-source", "digest": "sha256:ddd",
+             "type": "source-archive", "scope": "component",
+             "component": "common",
+             "provided_at": "2026-09-30T10:00:00+08:00"},
+        ] if materials is None else materials
+        return {
+            "attestation_id": att_id,
+            "batch_id": "att-rel-1",
+            "batch_hash": batch_hash,
+            "now": now,
+            "release_at": "2026-09-25T16:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+            "workdays": [1, 2, 3, 4, 5],
+            "holidays": ["2026-10-01", "2026-10-02"],
+            "obligations": {
+                "attribution": {"offset": 30, "unit": "calendar_day",
+                                "depends_on": []},
+                "license-text": {"offset": 20, "unit": "calendar_day",
+                                 "depends_on": []},
+                "source-offer": {"offset": 5, "unit": "business_day",
+                                 "depends_on": ["license-text"]},
+            },
+            "materials": mats,
+            "rules": {"obligations": {
+                "attribution": {"type": "notice"},
+                "license-text": {"all": [
+                    {"type": "notice"},
+                    {"any": [{"type": "license-copy"},
+                             {"type": "license-bundle"}]},
+                ]},
+                "source-offer": {"all": [
+                    {"type": "source-archive"}, {"scope": "component"},
+                ]},
+            }},
+        }
+
+    code, att = call("POST", path, att_body())
+    check("attestation: 200 minted when every instance is satisfied",
+          code == 200 and att.get("created") is True, json.dumps(att)[:300])
+    check("attestation: hashes present and sha256-shaped",
+          len(att.get("attestation_hash", "")) == 64
+          and len(att.get("snapshot_hash", "")) == 64
+          and att.get("batch_hash") == batch_hash)
+    check("attestation: embedded snapshot all satisfied",
+          att["snapshot"]["summary"] == {
+              "total": 6, "satisfied": 6, "overdue": 0, "pending": 0}
+          and all(i["status"] == "satisfied"
+                  for i in att["snapshot"]["instances"]),
+          json.dumps(att["snapshot"]["summary"]))
+    check("attestation: adopted rule revisions frozen from the batch",
+          sorted(r["assessment_id"] for r in att["rule_revisions"])
+          == expected_rule_revisions
+          and all(len(r["revision"]) == 16 and len(r["rules_hash"]) == 64
+                  for r in att["rule_revisions"]),
+          json.dumps(att["rule_revisions"])[:200])
+    att_hash = att["attestation_hash"]
+    snap_hash = att["snapshot_hash"]
+
+    # GET returns the stored proof without the created flag
+    code, got = call("GET", "/v1/admission-attestations/att-001")
+    check("attestation: GET stored proof without created flag",
+          code == 200 and "created" not in got
+          and got["attestation_hash"] == att_hash
+          and got["snapshot_hash"] == snap_hash
+          and got["batch_id"] == "att-rel-1")
+
+    # idempotent replay: identical normalized content -> same proof
+    code, again = call("POST", path, att_body())
+    check("attestation: identical replay is idempotent (created=false)",
+          code == 200 and again.get("created") is False
+          and again["attestation_hash"] == att_hash
+          and again["snapshot_hash"] == snap_hash)
+
+    # equivalent UTC instant spellings + reordered arrays/keys -> still same
+    eq = att_body()
+    eq["release_at"] = "2026-09-25T08:00:00Z"
+    eq["now"] = "2026-10-01T04:00:00Z"
+    eq["materials"] = list(reversed(eq["materials"]))
+    eq["workdays"] = [5, 4, 3, 2, 1]
+    eq["holidays"] = ["2026-10-02", "2026-10-01"]
+    eq["obligations"] = {
+        "source-offer": {"depends_on": ["license-text"], "unit": "business_day",
+                         "offset": 5},
+        "attribution": {"depends_on": [], "unit": "calendar_day", "offset": 30},
+        "license-text": {"depends_on": [], "unit": "calendar_day", "offset": 20},
+    }
+    code, eqout = call("POST", path, eq)
+    check("attestation: equivalent instants/order replay stays idempotent",
+          code == 200 and eqout.get("created") is False
+          and eqout["attestation_hash"] == att_hash
+          and eqout["snapshot_hash"] == snap_hash,
+          json.dumps(eqout)[:160])
+
+    # different normalized content under the same id -> 409 conflict
+    diff = att_body()
+    diff["now"] = "2026-10-02T12:00:00+08:00"
+    code, conf = call("POST", path, diff)
+    check("attestation: same id different content -> 409",
+          code == 409 and conf.get("reason") == "attestation-id-reused"
+          and conf.get("registered_batch_id") == "att-rel-1"
+          and len(conf.get("registered_request_hash", "")) == 64
+          and conf.get("request_hash") != conf.get("registered_request_hash"),
+          json.dumps(conf)[:240])
+    # conflict must not have rewritten the registered proof
+    code, got = call("GET", "/v1/admission-attestations/att-001")
+    check("attestation: conflict replay left stored proof unchanged",
+          got["attestation_hash"] == att_hash)
+
+    # pending instances (now before deadline, evidence incomplete) -> 409
+    pending = att_body(att_id="att-pending",
+                       materials=[m for m in att_body()["materials"]
+                                  if m["id"] != "common-source"])
+    code, po = call("POST", path, pending)
+    pstat = {i["obligation"]: i["status"]
+             for i in po.get("unsatisfied_instances", [])}
+    check("attestation: pending instance refuses admission with details",
+          code == 409 and po.get("reason") == "obligations-not-satisfied"
+          and po.get("snapshot_hash")
+          and pstat == {"source-offer": "pending"}
+          and po["summary"]["satisfied"] == 5 and po["summary"]["pending"] == 1
+          and po["unsatisfied_instances"][0]["gaps"][0]["reason"]
+          == "incomplete-evidence",
+          json.dumps(po)[:240])
+    code, _ = call("GET", "/v1/admission-attestations/att-pending")
+    check("attestation: refused pending proof leaves no record", code == 404)
+
+    # overdue instances (now past 10-06, evidence incomplete) -> 409
+    overdue = att_body(att_id="att-overdue", now="2026-10-10T12:00:00+08:00",
+                       materials=[])
+    code, oo = call("POST", path, overdue)
+    # attribution deadline 10-25 is still open -> pending; the tightened
+    # license-text/source-offer 10-06 deadlines are past -> overdue
+    check("attestation: overdue/no-evidence instances refuse (409)",
+          code == 409 and oo.get("reason") == "obligations-not-satisfied"
+          and oo["summary"] == {"total": 6, "satisfied": 0,
+                                "overdue": 3, "pending": 3}
+          and all(i["gaps"][0]["reason"] == "no-matching-material"
+                  for i in oo["unsatisfied_instances"]),
+          json.dumps(oo.get("summary")))
+    code, _ = call("GET", "/v1/admission-attestations/att-overdue")
+    check("attestation: refused overdue proof leaves no record", code == 404)
+
+    # expected batch hash mismatch -> 409, no record
+    wrong = att_body(att_id="att-wronghash")
+    wrong["batch_hash"] = "f" * 64
+    code, wh = call("POST", path, wrong)
+    check("attestation: batch hash mismatch -> 409 with both hashes",
+          code == 409 and wh.get("reason") == "batch-hash-mismatch"
+          and wh.get("expected_batch_hash") == "f" * 64
+          and wh.get("registered_batch_hash") == batch_hash,
+          json.dumps(wh)[:200])
+    code, _ = call("GET", "/v1/admission-attestations/att-wronghash")
+    check("attestation: hash mismatch leaves no record", code == 404)
+
+    # unknown batch -> 404
+    ghost = att_body()
+    ghost["batch_id"] = "no-such-batch"
+    code, _ = call(
+        "POST",
+        "/v1/release-batches/no-such-batch/admission-attestation", ghost)
+    check("attestation: unknown batch -> 404", code == 404)
+
+    # body/path batch id disagreement -> 422
+    disagree = att_body()
+    disagree["batch_id"] = "att-rel-2"
+    code, _ = call("POST", path, disagree)
+    check("attestation: body/path batch_id disagreement -> 422", code == 422)
+
+    # invalid snapshot inputs -> whole-request 422, no record
+    def mutate(fn, att_id="att-badinput"):
+        b2 = json.loads(json.dumps(att_body(att_id)))
+        fn(b2)
+        return b2
+
+    bad_inputs = [
+        ("unknown timezone", mutate(lambda b: b.update(timezone="Mars/Olympus"))),
+        ("bad now", mutate(lambda b: b.update(now="2026-10-03 12:00"))),
+        ("null now", mutate(lambda b: b.update(now=None))),
+        ("bad release_at",
+         mutate(lambda b: b.update(release_at="2026-09-25T16:00:00"))),
+        ("missing obligation rule",
+         mutate(lambda b: b["obligations"].pop("attribution"))),
+        ("dangling depends_on",
+         mutate(lambda b: b["obligations"]["attribution"]
+                .update(depends_on=["ghost"]))),
+        ("dependency cycle",
+         mutate(lambda b: b["obligations"]["license-text"]
+                .update(depends_on=["source-offer"]))),
+        ("bad provided_at",
+         mutate(lambda b: b["materials"][0].update(provided_at="yesterday"))),
+        ("duplicate material id",
+         mutate(lambda b: b["materials"].append(dict(b["materials"][0])))),
+        ("material unknown component",
+         mutate(lambda b: b["materials"].append(
+             {"id": "x", "type": "notice", "scope": "component",
+              "component": "ghost", "provided_at": "2026-09-26T10:00:00Z"}))),
+        ("rule all+any",
+         mutate(lambda b: b["rules"]["obligations"]["attribution"].update(
+             {"all": [{"type": "notice"}], "any": [{"type": "x"}]}))),
+        ("rule unknown component",
+         mutate(lambda b: b["rules"]["obligations"]["attribution"].update(
+             {"component": "ghost", "type": "notice"}))),
+    ]
+    for i, (label, bad) in enumerate(bad_inputs):
+        aid = "att-badinput-%d" % i
+        bad["attestation_id"] = aid
+        code, bo = call("POST", path, bad)
+        check("attestation: 422 on %s (no record)" % label,
+              code == 422 and "attestation_hash" not in bo,
+              "%s -> %s %s" % (label, code, json.dumps(bo)[:120]))
+        code, _ = call("GET", "/v1/admission-attestations/%s" % aid)
+        check("attestation: %s left no record" % label, code == 404)
+
+    # envelope errors -> 400
+    missing_obligations = {k: v for k, v in att_body("ok-id").items()
+                           if k != "obligations"}
+    bad_envelopes = [
+        ["not-an-object"],
+        {"attestation_id": "", "batch_id": "att-rel-1",
+         "batch_hash": batch_hash},
+        {"attestation_id": "x", "batch_id": "att-rel-1",
+         "batch_hash": batch_hash},
+        {"attestation_id": "ok-id", "batch_id": "",
+         "batch_hash": batch_hash},
+        {"attestation_id": "ok-id", "batch_id": "att-rel-1",
+         "batch_hash": "deadbeef"},
+        {"attestation_id": "ok id!", "batch_id": "att-rel-1",
+         "batch_hash": batch_hash},
+        missing_obligations,
+        json.loads(json.dumps(att_body("ok-id"))) | {"batch_hash": 12345},
+    ]
+    for i, bad in enumerate(bad_envelopes):
+        code, bo = call("POST", path, bad)
+        check("attestation: envelope error %d -> 400" % i, code == 400
+              and "attestation_hash" not in bo, "%s" % json.dumps(bo)[:100])
+
+    # later rule publication must not rewrite the registered proof
+    code, hist = call("GET", "/v1/rulesets/attrel/revisions")
+    active = hist["active_revision"]
+    code, rev = call("POST", "/v1/rulesets/attrel/revisions", {
+        "rules": {"licenses": {
+            "A-MIT": {"obligations": ["attribution"]},
+            "A-GPL": {"obligations": ["attribution"]},
+            "A-ISC": {"obligations": ["attribution"]}}},
+        "base_revision": active})
+    check("attestation: changed-rules draft created", code == 200, str(code))
+    code, act = call(
+        "POST", "/v1/rulesets/attrel/revisions/%s/activate" % rev["revision"],
+        {"expected_active_revision": active})
+    check("attestation: changed rules published", code == 200, json.dumps(act))
+    code, frozen = call("GET", "/v1/admission-attestations/att-001")
+    check(
+        "attestation: proof immutable after later rule publication",
+        code == 200 and frozen["attestation_hash"] == att_hash
+        and frozen["snapshot_hash"] == snap_hash
+        and frozen["snapshot"]["summary"]["satisfied"] == 6
+        and frozen["rule_revisions"] and all(
+            r["revision"] != rev["revision"]
+            for r in frozen["rule_revisions"]),
+        json.dumps(frozen.get("rule_revisions"))[:200],
+    )
+    code, frozen_batch = call("GET", "/v1/release-batches/att-rel-1")
+    check("attestation: batch manifest also unchanged",
+          frozen_batch["batch_hash"] == batch_hash)
+
+    # unknown attestation -> 404
+    code, _ = call("GET", "/v1/admission-attestations/ghost-att")
+    check("attestation: GET unknown -> 404", code == 404)
+
+    # concurrent registrations of the same attestation id with identical
+    # content: the write lock serializes them into one create + one replay,
+    # never two created rows and never a content conflict
+    results = []
+
+    def fire(idx):
+        code, out = call("POST", path, att_body("att-concurrent"))
+        results.append((idx, code, out.get("created")))
+
+    threads = [threading.Thread(target=fire, args=(i,)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check(
+        "attestation: concurrent same-id content -> one create + replays",
+        len(results) == 6
+        and all(code == 200 for _, code, _ in results)
+        and sorted(created for _, _, created in results).count(True) == 1
+        and sorted(created for _, _, created in results).count(False) == 5,
+        str(results),
+    )
+
+    # concurrent registrations of one id with different content serialize
+    # to a single winner; all losers receive the 409 conflict
+    outcomes = []
+
+    def fire_diff(now_value):
+        b = att_body("att-concurrent-diff", now=now_value)
+        code, out = call("POST", path, b)
+        outcomes.append((now_value, code, out.get("reason")))
+
+    nows = ["2026-10-01T%02d:00:00+08:00" % h for h in range(6, 12)]
+    threads = [threading.Thread(target=fire_diff, args=(n,)) for n in nows]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check(
+        "attestation: concurrent different content -> one win, rest 409",
+        len(outcomes) == 6
+        and sum(1 for _, code, _ in outcomes if code == 200) == 1
+        and sorted(code for _, code, _ in outcomes).count(409) == 5
+        and all(reason in (None, "attestation-id-reused")
+                for _, _, reason in outcomes),
+        str(outcomes),
+    )
+    code, _ = call("GET", "/v1/admission-attestations/att-concurrent-diff")
+    check("attestation: exactly one winner persisted", code == 200)
+
+
+def run_accounting_snapshot_checks():
+    """Regression: the four accounting entry points share one immutable
+    proven snapshot (normalized request, result, summary_hash and rules
+    snapshot vs. revision, all checked in a read-only transaction).
+
+    On a dedicated database:
+
+    * tamper each persisted column in turn -- confirm, compare,
+      remediation and impact-review must all refuse the row with the same
+      409 (``rules-snapshot-unverifiable``), while untouched ids still
+      work;
+    * after the ruleset is overwritten by a new revision every entry
+      keeps operating on the *historical* snapshot (remediation replays
+      the old summary hash, impact review against the active revision is
+      a no-op, compare against the new assessment sees real rule diffs)
+      and never silently falls back to active rules;
+    * a missing id keeps its 404 semantics;
+    * once the ruleset is rolled back to the original content the
+      historical row verifies and confirms again.
+    """
+    tmp = tempfile.mkdtemp(prefix="licapi-accounting-")
+    db = os.path.join(tmp, "accounting.db")
+    store = Store(db)
+    api = Api(store)
+
+    v1 = validate_ruleset({
+        "licenses": {
+            "MIT": {"obligations": ["attribution"]},
+            "GPL-2.0-only": {"obligations": ["attribution", "source-offer"],
+                             "propagates": ["static"]},
+            "Apache-2.0": {"obligations": ["attribution"],
+                           "incompatible_with": ["GPL-2.0-only"]},
+        }
+    })
+    v2 = validate_ruleset({
+        "licenses": {
+            "MIT": {"obligations": ["attribution", "license-text"]},
+            "GPL-2.0-only": {"obligations": ["attribution", "source-offer"],
+                             "propagates": ["static"]},
+            "Apache-2.0": {"obligations": ["attribution"],
+                           "incompatible_with": ["GPL-2.0-only"]},
+        }
+    })
+    assert api.put_ruleset("snap", v1)["created"] is True
+    r1 = api.list_revisions("snap")["active_revision"]
+
+    ok_body = {
+        "ruleset": "snap",
+        "product": "snap-ok",
+        "components": [{"id": "m", "license": "MIT"}],
+    }
+    ok = api.create_assessment(json.loads(json.dumps(ok_body)))
+    aid_ok = ok["id"]
+    ok_hash = ok["result"]["summary_hash"]
+    assert ok["result"]["status"] == "ok"
+
+    conflict_body = {
+        "ruleset": "snap",
+        "product": "snap-conflict",
+        "components": [
+            {"id": "app", "license": "Apache-2.0"},
+            {"id": "g", "license": "GPL-2.0-only", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "app", "to": "g"}],
+    }
+    cf = api.create_assessment(json.loads(json.dumps(conflict_body)))
+    aid_cf = cf["id"]
+    cf_hash = cf["result"]["summary_hash"]
+    assert cf["result"]["status"] == "conflict"
+
+    def assert_refused(label, fn):
+        try:
+            fn()
+            check("accounting: %s refused" % label, False, "no error raised")
+        except ConflictError as exc:
+            check(
+                "accounting: %s refused (shared snapshot reason)" % label,
+                exc.details is not None
+                and exc.details.get("reason") == "rules-snapshot-unverifiable",
+                str(getattr(exc, "details", None)),
+            )
+
+    def assert_not_found(label, fn):
+        try:
+            fn()
+            check("accounting: %s -> 404" % label, False, "no error raised")
+        except NotFound:
+            check("accounting: %s -> 404" % label, True)
+
+    # -- untouched rows are accepted by every entry --------------------------
+    conf = api.confirm(aid_ok)
+    check("accounting: confirm uses the shared snapshot",
+          conf["replay"]["rules_hash"] == stable_hash(v1)
+          and conf["replay"]["expected_summary_hash"] == ok_hash)
+    rep = api.impact_review("snap", r1,
+                            {"base_revision": r1, "assessment_ids": [aid_ok]})
+    check("accounting: impact review on the active revision verifies the snapshot",
+          rep["items"][0]["new_summary_hash"] == ok_hash
+          and rep["summary"]["status_changed_count"] == 0)
+    out = api.compare({"baseline_id": aid_ok, "target_id": aid_cf})
+    check("accounting: compare loads two shared snapshots",
+          out["baseline_id"] == aid_ok and out["target_id"] == aid_cf)
+
+    # -- direct SQLite tampering: every entry refuses the same provenance ----
+    originals = {}
+    conn = sqlite3.connect(db)
+    for col in ("request", "result", "rules", "revision", "summary_hash"):
+        originals[col] = conn.execute(
+            "SELECT %s FROM assessments WHERE id = ?" % col, (aid_ok,)
+        ).fetchone()[0]
+
+    def write_col(col, value):
+        conn.execute(
+            "UPDATE assessments SET %s = ? WHERE id = ?" % col,
+            (value, aid_ok),
+        )
+        conn.commit()
+
+    tampered_request = json.loads(originals["request"])
+    tampered_request["product"] = "tampered"
+    write_col("request", json.dumps(tampered_request, sort_keys=True))
+    assert_refused("tampered request: confirm", lambda: api.confirm(aid_ok))
+    assert_refused("tampered request: compare",
+                   lambda: api.compare({"baseline_id": aid_ok, "target_id": aid_cf}))
+    assert_refused("tampered request: remediation",
+                   lambda: api.remediation_plan(
+                       aid_ok, {"components": {}}))
+    assert_refused("tampered request: impact review",
+                   lambda: api.impact_review(
+                       "snap", r1,
+                       {"base_revision": r1, "assessment_ids": [aid_ok]}))
+    # the untouched id keeps working even while the other row is corrupt
+    check("accounting: untouched row still reviewed while a peer is corrupt",
+          api.impact_review(
+              "snap", r1,
+              {"base_revision": r1, "assessment_ids": [aid_cf]}
+          )["items"][0]["new_summary_hash"] == cf_hash)
+    write_col("request", originals["request"])
+    check("accounting: restored row confirms again",
+          api.confirm(aid_ok)["replay"]["expected_summary_hash"] == ok_hash)
+
+    # tamper the stored conclusion body (the recorded summary_hash stays
+    # the old one, so replay of request+rules can no longer reproduce it)
+    tampered_result = json.loads(originals["result"])
+    if tampered_result.get("components"):
+        tampered_result["components"][0]["obligations"].append("tampered-obligation")
+        tampered_result["components"][0]["obligations"].sort()
+    else:
+        tampered_result["distribution"] = "saas"
+    write_col("result", json.dumps(tampered_result, sort_keys=True))
+    assert_refused("tampered result: confirm", lambda: api.confirm(aid_ok))
+    assert_refused("tampered result: compare",
+                   lambda: api.compare({"baseline_id": aid_cf, "target_id": aid_ok}))
+    assert_refused("tampered result: impact review",
+                   lambda: api.impact_review(
+                       "snap", r1,
+                       {"base_revision": r1,
+                        "assessment_ids": [aid_cf, aid_ok]}))
+    write_col("result", originals["result"])
+
+    write_col("rules", json.dumps(v2, sort_keys=True))
+    assert_refused("swapped rules snapshot: confirm", lambda: api.confirm(aid_ok))
+    assert_refused("swapped rules snapshot: remediation",
+                   lambda: api.remediation_plan(
+                       aid_ok, {"components": {}}))
+    assert_refused("swapped rules snapshot: impact review",
+                   lambda: api.impact_review(
+                       "snap", r1,
+                       {"base_revision": r1, "assessment_ids": [aid_ok]}))
+    write_col("rules", originals["rules"])
+
+    # same swap on the conflict row, exercised through remediation
+    conn.commit()
+    conn.execute(
+        "UPDATE assessments SET rules = ? WHERE id = ?",
+        (json.dumps(v2, sort_keys=True), aid_cf),
+    )
+    conn.commit()
+    assert_refused("swapped rules snapshot: remediation (conflict row)",
+                   lambda: api.remediation_plan(
+                       aid_cf, {"components": {}}))
+    conn.execute(
+        "UPDATE assessments SET rules = ? WHERE id = ?",
+        (originals["rules"], aid_cf),
+    )
+    conn.commit()
+
+    write_col("revision", "0" * 16)
+    assert_refused("stale revision pointer: confirm", lambda: api.confirm(aid_ok))
+    assert_refused("stale revision pointer: compare",
+                   lambda: api.compare({"baseline_id": aid_ok, "target_id": aid_ok}))
+    # impact review catches the fake pointer at its revision-mismatch
+    # gate (same whole-batch 409 semantics, never a report)
+    try:
+        api.impact_review("snap", r1,
+                          {"base_revision": r1, "assessment_ids": [aid_ok]})
+        check("accounting: stale revision pointer: impact review refused",
+              False, "no error raised")
+    except ConflictError as exc:
+        check(
+            "accounting: stale revision pointer: impact review refused",
+            exc.details is not None
+            and exc.details.get("reason") == "assessment-revision-mismatch",
+            str(getattr(exc, "details", None)),
+        )
+    write_col("revision", originals["revision"])
+
+    write_col("summary_hash", "0" * 64)
+    assert_refused("tampered summary_hash column: confirm",
+                   lambda: api.confirm(aid_ok))
+    assert_refused("tampered summary_hash column: compare",
+                   lambda: api.compare({"baseline_id": aid_ok, "target_id": aid_ok}))
+    assert_refused("tampered summary_hash column: remediation",
+                   lambda: api.remediation_plan(
+                       aid_ok, {"components": {}}))
+    assert_refused("tampered summary_hash column: impact review",
+                   lambda: api.impact_review(
+                       "snap", r1,
+                       {"base_revision": r1, "assessment_ids": [aid_ok]}))
+    write_col("summary_hash", originals["summary_hash"])
+
+    # an unverifiable id poisons an impact-review batch as one 409
+    # payload.  Simulate a corrupt (un-restorable) named snapshot: an
+    # unpinned rules column pointing at a ruleset whose stored content
+    # cannot reproduce the row's hash, under a revision that still
+    # matches the active one so the batch reaches the shared snapshot
+    # gate.
+    other = validate_ruleset({
+        "licenses": {"MIT": {"obligations": ["attribution", "notice-preserve"]}}
+    })
+    write_col("rules", None)
+    mirror = conn.execute(
+        "SELECT body FROM rulesets WHERE name = 'snap'"
+    ).fetchone()[0]
+    conn.execute(
+        "UPDATE rulesets SET body = ? WHERE name = 'snap'",
+        (json.dumps(other, sort_keys=True),),
+    )
+    conn.commit()
+    try:
+        api.impact_review("snap", r1,
+                          {"base_revision": r1,
+                           "assessment_ids": [aid_cf, aid_ok]})
+        check("accounting: unverifiable id fails the whole review batch",
+              False, "no error raised")
+    except ConflictError as exc:
+        check(
+            "accounting: unverifiable id fails the whole review batch",
+            exc.details is not None
+            and exc.details.get("reason") == "rules-snapshot-unverifiable"
+            and exc.details.get("assessment_ids") == [aid_ok],
+            str(getattr(exc, "details", None)),
+        )
+    # the single-load entries refuse the same corrupt row too
+    assert_refused("unrestorable row: confirm", lambda: api.confirm(aid_ok))
+    assert_refused("unrestorable row: compare",
+                   lambda: api.compare({"baseline_id": aid_ok, "target_id": aid_cf}))
+    write_col("rules", originals["rules"])
+    conn.execute("UPDATE rulesets SET body = ? WHERE name = 'snap'", (mirror,))
+    conn.commit()
+    conn.close()
+
+    # -- missing ids keep the 404 semantics at each entry --------------------
+    missing = "f" * 32
+    assert_not_found("missing confirm", lambda: api.confirm(missing))
+    assert_not_found("missing remediation",
+                     lambda: api.remediation_plan(missing, {"components": {}}))
+    assert_not_found("missing compare baseline",
+                     lambda: api.compare({"baseline_id": missing,
+                                          "target_id": aid_ok}))
+    assert_not_found("missing compare target",
+                     lambda: api.compare({"baseline_id": aid_ok,
+                                          "target_id": missing}))
+    try:
+        api.impact_review("snap", r1,
+                          {"base_revision": r1, "assessment_ids": [missing]})
+        check("accounting: missing impact-review id -> 409 (existing semantics)",
+              False, "no error raised")
+    except ConflictError as exc:
+        check(
+            "accounting: missing impact-review id -> 409 (existing semantics)",
+            exc.details is not None
+            and exc.details.get("reason") == "assessment-not-found",
+            str(getattr(exc, "details", None)),
+        )
+
+    # -- overwrite the ruleset: historical snapshots stay authoritative ------
+    api.put_ruleset("snap", v2)
+    r2 = api.list_revisions("snap")["active_revision"]
+    check("accounting: overwrite published a new revision", r2 != r1)
+
+    # same request under active rules is a *different* assessment/hash
+    ok_v2 = api.create_assessment(json.loads(json.dumps(ok_body)))
+    check(
+        "accounting: new rules mint a new assessment",
+        ok_v2["id"] != aid_ok and ok_v2["result"]["summary_hash"] != ok_hash,
+    )
+
+    # confirm still replays the pre-overwrite snapshot, never v2
+    conf = api.confirm(aid_ok)
+    check(
+        "accounting: confirm after overwrite pins the historical snapshot",
+        conf["replay"]["rules_hash"] == stable_hash(v1)
+        and conf["replay"]["rules_hash"] != stable_hash(v2)
+        and conf["replay"]["expected_summary_hash"] == ok_hash,
+    )
+
+    # remediation re-assesses under the historical v1 snapshot: the best
+    # plan's reassessed hash is the *old* conflict hash, not a v2 result
+    body = {"components": {"g": [{"id": "mit", "expression": "MIT", "cost": 1}]}}
+    plan = None
+    try:
+        plan = api.remediation_plan(aid_cf, body)
+        check("accounting: remediation after overwrite becomes releasable",
+              plan is not None and plan["release"] is True)
+    except RemediationConflict:
+        check("accounting: remediation after overwrite becomes releasable",
+              False, "no release plan found")
+    if plan is not None:
+        check(
+            "accounting: remediation replays historical (v1) rules",
+            plan["reassessed"]["summary_hash"]
+            == assess_normalized(
+                normalize_request({
+                    "components": [
+                        {"id": "app", "license": "Apache-2.0"},
+                        {"id": "g", "license": "MIT", "linkage": "static"},
+                    ],
+                    "dependencies": [{"from": "app", "to": "g"}],
+                }),
+                v1,
+            )["summary_hash"],
+        )
+        check("accounting: remediation payload fields unchanged",
+              "remediation_hash" in plan and "total_cost" in plan
+              and plan["assessment_id"] == aid_cf)
+
+    # compare of the two revisions runs on each side's own snapshot and
+    # sees the real MIT license-rule difference (plus product diffs)
+    out = api.compare({"baseline_id": aid_ok, "target_id": ok_v2["id"]})
+    check(
+        "accounting: compare mixes historical and current snapshots, no fallback",
+        any(d["kind"] == "license-rule" and d["license"] == "MIT"
+            for d in out["diffs"])
+        and out["counterfactual"]["baseline_summary_hash"] == ok_hash,
+        json.dumps(out["diffs"])[:240],
+    )
+
+    # impact review prepared at the now-active r2 with target r2 is a
+    # no-op for the *new* (r2-recorded) assessment; the old r1 row is
+    # excluded with the existing revision-mismatch semantics instead of
+    # being silently re-read under active rules
+    rep = api.impact_review("snap", r2,
+                            {"base_revision": r2,
+                             "assessment_ids": [ok_v2["id"]]})
+    check("accounting: impact review on active r2 re-runs the r2 snapshot",
+          rep["items"][0]["new_summary_hash"] == ok_v2["result"]["summary_hash"]
+          and rep["summary"]["status_changed_count"] == 0)
+    try:
+        api.impact_review("snap", r2,
+                          {"base_revision": r2, "assessment_ids": [aid_ok]})
+        check("accounting: old-revision row not accepted under active r2",
+              False, "no error raised")
+    except ConflictError as exc:
+        check(
+            "accounting: old-revision row not accepted under active r2",
+            exc.details is not None
+            and exc.details.get("reason") == "assessment-revision-mismatch"
+            and exc.details.get("assessment_ids") == [aid_ok],
+            str(getattr(exc, "details", None)),
+        )
+
+    # rollback to the original content: the historical row verifies again
+    api.activate_revision("snap", r1, {"expected_active_revision": r2})
+    check(
+        "accounting: historical row verifies after content rollback",
+        api.impact_review(
+            "snap", r1,
+            {"base_revision": r1, "assessment_ids": [aid_cf]}
+        )["items"][0]["new_summary_hash"] == cf_hash
+        and api.confirm(aid_ok)["replay"]["expected_summary_hash"] == ok_hash,
+    )
+
+
+def run_legacy_migration_checks():
+    """Open a pre-upgrade database (assessments without a rules snapshot).
+
+    Three legacy rows are inserted:
+
+    * healable      -- named a ruleset whose current content is unchanged;
+    * overwritten   -- named a ruleset that has since been replaced;
+    * inline        -- a legacy inline-rule request (ruleset NULL).
+
+    Opening the store must auto-migrate: the healable row is pinned, the
+    other two stay unpinned.  Confirmation must succeed only for the
+    healable row (and its replay must reproduce the original hash); the
+    unverifiable rows must be refused with 409, never given fake replays.
+    """
+    tmp = tempfile.mkdtemp(prefix="licapi-legacy-")
+    db = os.path.join(tmp, "legacy.db")
+
+    legacy_schema = """
+    CREATE TABLE rulesets (
+        name TEXT PRIMARY KEY, body TEXT NOT NULL, created_at TEXT NOT NULL
+    );
+    CREATE TABLE assessments (
+        id TEXT PRIMARY KEY, ruleset TEXT, request TEXT NOT NULL,
+        result TEXT NOT NULL, status TEXT NOT NULL,
+        summary_hash TEXT NOT NULL, created_at TEXT NOT NULL
+    );
+    CREATE TABLE confirmations (
+        assessment_id TEXT PRIMARY KEY, body TEXT NOT NULL, created_at TEXT NOT NULL
+    );
+    """
+    conn = sqlite3.connect(db)
+    conn.executescript(legacy_schema)
+
+    default_rules = validate_ruleset(DEFAULT_RULESET)
+    legacy_rules = validate_ruleset(
+        {"licenses": {"L-1.0": {"obligations": ["attribution"]}}}
+    )
+    conn.execute(
+        "INSERT INTO rulesets(name, body, created_at) VALUES (?,?,?)",
+        ("default", json.dumps(default_rules, sort_keys=True), "2024-01-01T00:00:00+00:00"),
+    )
+    conn.execute(
+        "INSERT INTO rulesets(name, body, created_at) VALUES (?,?,?)",
+        ("legacy", json.dumps(legacy_rules, sort_keys=True), "2024-01-01T00:00:00+00:00"),
+    )
+
+    def legacy_row(aid_rules, ruleset_name, request_body):
+        norm = normalize_request(request_body)
+        result = assess_normalized(norm, aid_rules)
+        aid = stable_hash({"request": norm, "rules": aid_rules})[:32]
+        conn.execute(
+            "INSERT INTO assessments"
+            "(id, ruleset, request, result, status, summary_hash, created_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (
+                aid,
+                ruleset_name,
+                json.dumps(norm, sort_keys=True),
+                json.dumps(result, sort_keys=True),
+                result["status"],
+                result["summary_hash"],
+                "2024-01-01T00:00:00+00:00",
+            ),
+        )
+        return aid, result["summary_hash"]
+
+    heal_aid, heal_hash = legacy_row(
+        default_rules, "default",
+        {"components": [{"id": "h", "license": "MIT"}]},
+    )
+    over_aid, over_hash = legacy_row(
+        legacy_rules, "legacy",
+        {"components": [{"id": "o", "license": "L-1.0"}]},
+    )
+    inline_aid, _inline_hash = legacy_row(
+        legacy_rules, None,
+        {"components": [{"id": "i", "license": "L-1.0"}]},
+    )
+    # overwrite the "legacy" ruleset *before* the new code ever opens the db
+    changed_rules = validate_ruleset(
+        {"licenses": {"L-1.0": {"obligations": ["attribution", "license-text"]}}}
+    )
+    conn.execute(
+        "UPDATE rulesets SET body = ? WHERE name = 'legacy'",
+        (json.dumps(changed_rules, sort_keys=True),),
+    )
+    conn.commit()
+    conn.close()
+
+    # opening triggers the schema migration + startup verification/healing
+    api = Api(Store(db))
+
+    healed = api.store.get_assessment(heal_aid)
+    check("legacy healable row pinned on migration", healed["rules"] == default_rules)
+    overwritten = api.store.get_assessment(over_aid)
+    check("legacy overwritten row stays unpinned", overwritten["rules"] is None)
+    inline_row = api.store.get_assessment(inline_aid)
+    check("legacy inline row stays unpinned", inline_row["rules"] is None)
+
+    # healed row confirms and its fixed replay reproduces the original hash
+    conf = api.confirm(heal_aid)
+    replay_req = conf["replay"]["request"]
+    check(
+        "legacy healed confirmation replay pins snapshot",
+        isinstance(replay_req.get("rules"), dict)
+        and conf["replay"]["rules_hash"] == stable_hash(default_rules),
+    )
+    replayed = assess_normalized(
+        normalize_request(replay_req), validate_ruleset(replay_req["rules"])
+    )
+    check(
+        "legacy healed replay reproduces summary hash",
+        replayed["summary_hash"] == heal_hash,
+    )
+
+    # unverifiable rows: explicit refusal, never a fabricated confirmation
+    for aid, why in ((over_aid, "overwritten"), (inline_aid, "inline")):
+        try:
+            api.confirm(aid)
+            check("legacy %s row confirmation refused" % why, False, "no error raised")
+        except ConflictError:
+            check("legacy %s row confirmation refused" % why, True)
+
+    # comparison against an unverifiable row is refused as well (never
+    # compared against guessed rules); a healed row compares fine
+    try:
+        api.compare({"baseline_id": heal_aid, "target_id": over_aid})
+        check("legacy unverifiable row compare refused", False, "no error raised")
+    except ConflictError:
+        check("legacy unverifiable row compare refused", True)
+    out = api.compare({"baseline_id": heal_aid, "target_id": heal_aid})
+    check(
+        "legacy healed row self-compare",
+        out["diff_count"] == 0 and out["conclusions_agree"] is True,
+    )
+
+    # the shared snapshot gate also backs impact review: the healed row
+    # (stamped with the migrated default revision) is reviewed cleanly
+    # against the active revision, while an un-restorable row fails the
+    # whole batch with the same rules-snapshot-unverifiable reason
+    default_rev = api.list_revisions("default")["active_revision"]
+    try:
+        rep = api.impact_review(
+            "default", default_rev,
+            {"base_revision": default_rev, "assessment_ids": [heal_aid]},
+        )
+        ok_review = (
+            rep["assessed_count"] == 1
+            and rep["items"][0]["new_summary_hash"] == heal_hash
+            and rep["summary"]["status_changed_count"] == 0
+        )
+    except ConflictError:
+        ok_review = False
+    check("legacy healed row accepted by impact review", ok_review)
+    for aid, why in ((over_aid, "overwritten"), (inline_aid, "inline")):
+        try:
+            api.impact_review(
+                "default", default_rev,
+                {"base_revision": default_rev, "assessment_ids": [aid]},
+            )
+            refused = False
+        except ConflictError as exc:
+            refused = exc.details is not None and exc.details.get("reason") in (
+                "rules-snapshot-unverifiable",
+                "assessment-ruleset-mismatch",
+                "assessment-revision-mismatch",
+            )
+        # neither row can ever be reviewed under guessed or active rules
+        check("legacy %s row impact review refused (409)" % why, refused)
+    try:
+        api.impact_review(
+            "default", default_rev,
+            {"base_revision": default_rev,
+             "assessment_ids": [heal_aid, over_aid]},
+        )
+        batch_refused = False
+    except ConflictError:
+        batch_refused = True
+    check("legacy one unverifiable row fails the whole review batch",
+          batch_refused)
+
+    # restoring the original ruleset content makes the row verifiable again
+    api.store.put_ruleset("legacy", legacy_rules)
+    rules = api.store.recover_legacy_rules(over_aid)
+    check(
+        "legacy row heals after ruleset restored",
+        rules == legacy_rules and api.store.get_assessment(over_aid)["rules"] == legacy_rules,
+    )
+    conf = api.confirm(over_aid)
+    check(
+        "recovered row confirmation replay reproduces",
+        conf["replay"]["request"].get("rules") == legacy_rules
+        and conf["replay"]["expected_summary_hash"] == over_hash,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())

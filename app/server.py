@@ -1,0 +1,559 @@
+"""JSON HTTP API served by http.server.ThreadingHTTPServer (stdlib only).
+
+Endpoints:
+    GET  /health
+    GET  /v1/rulesets
+    PUT  /v1/rulesets/{name}
+    GET  /v1/rulesets/{name}
+    POST /v1/rulesets/{name}/revisions
+    GET  /v1/rulesets/{name}/revisions
+    POST /v1/rulesets/{name}/revisions/{revision}/activate
+    POST /v1/rulesets/{name}/revisions/{revision}/impact-review
+         (read-only pre-publication impact review over an assessment batch)
+    POST /v1/assessments
+    GET  /v1/assessments/{id}
+    POST /v1/assessments/{id}/confirm
+    GET  /v1/assessments/{id}/confirmation
+    POST /v1/assessments/{id}/fulfillment-check
+    POST /v1/assessments/{id}/obligation-schedule
+    POST /v1/assessments/{id}/responsibility-plan
+    POST /v1/assessments/{id}/remediation-plan
+    POST /v1/assessments/compare
+    POST /v1/release-batches
+    GET  /v1/release-batches/{batch_id}
+    POST /v1/release-batches/{batch_id}/fulfillment-snapshot
+    POST /v1/release-batches/{batch_id}/admission-attestation
+    GET  /v1/admission-attestations/{attestation_id}
+"""
+
+import json
+import re
+import sys
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+from .attestation import validate_attestation_body
+from .batches import validate_batch_body
+from .common import ClientError, ConflictError, NotFound, stable_hash
+from .compare import compare_assessments
+from .fulfillment import UnprocessableError, check_fulfillment
+from .remediation import RemediationConflict, plan_remediation
+from .responsibility import PartialPlanError, build_plan
+from .revisions import REVISION_ID_LEN
+from .review import build_impact_report, validate_review_body
+from .rules import validate_ruleset
+from .schedule import build_schedule
+from .snapshot import build_batch_snapshot
+from .solver import assess_normalized, build_confirmation, normalize_request
+
+MAX_BODY_BYTES = 16 * 1024 * 1024
+_NAME_RE = re.compile(r"^/v1/rulesets(?:/([A-Za-z0-9._-]{1,64}))?$")
+_REVISION_RE = re.compile(
+    r"^/v1/rulesets/([A-Za-z0-9._-]{1,64})/revisions"
+    r"(?:/([0-9a-f]{%d})(/(?:activate|impact-review))?)?$" % REVISION_ID_LEN
+)
+_ASSESS_RE = re.compile(
+    r"^/v1/assessments(?:/([0-9a-f]{8,64})"
+    r"(/(?:confirm|confirmation|fulfillment-check|obligation-schedule"
+    r"|responsibility-plan|remediation-plan))?)?$"
+)
+_BATCH_RE = re.compile(
+    r"^/v1/release-batches(?:/([A-Za-z0-9._-]{1,128})"
+    r"(/(?:fulfillment-snapshot|admission-attestation))?)?$"
+)
+_ATTEST_RE = re.compile(
+    r"^/v1/admission-attestations(?:/([A-Za-z0-9._-]{1,128}))?$"
+)
+
+
+class Api:
+    """Transport-independent core; the HTTP handler is a thin adapter."""
+
+    def __init__(self, store):
+        self.store = store
+
+    # -- rulesets ---------------------------------------------------------
+
+    def list_rulesets(self):
+        return {"rulesets": self.store.list_rulesets()}
+
+    def put_ruleset(self, name, body):
+        rules = validate_ruleset(body)
+        created = self.store.put_ruleset(name, rules)
+        return {"name": name, "created": created, "ruleset": rules}
+
+    def get_ruleset(self, name):
+        history = self.store.list_ruleset_revisions(name)
+        if history is None or history["active_revision"] is None:
+            # Drafts are invisible to legacy consumers: a name with no
+            # published revision behaves like a missing ruleset.
+            rules = self.store.get_ruleset(name)
+            if rules is None:
+                raise NotFound("ruleset %r not found" % name)
+            return {"name": name, "ruleset": rules}
+        active = next(r for r in history["revisions"] if r["active"])
+        return {
+            "name": name,
+            "ruleset": active["ruleset"],
+            "active_revision": history["active_revision"],
+        }
+
+    # -- immutable revisions ----------------------------------------------
+
+    def create_revision(self, name, body):
+        if not isinstance(body, dict):
+            raise ClientError("request body must be a JSON object")
+        if "rules" not in body:
+            raise ClientError("revision request requires a complete 'rules' object")
+        rules = validate_ruleset(body["rules"])
+        if "base_revision" not in body:
+            raise ClientError(
+                "revision request requires 'base_revision'"
+                " (null when creating the ruleset's first revision)"
+            )
+        base_revision = body["base_revision"]
+        if base_revision is not None and not isinstance(base_revision, str):
+            raise ClientError("base_revision must be a string or null")
+        rev = self.store.create_ruleset_revision(name, rules, base_revision)
+        rev["ruleset"] = rules
+        return rev
+
+    def activate_revision(self, name, revision, body):
+        if not isinstance(body, dict):
+            raise ClientError("request body must be a JSON object")
+        if "expected_active_revision" not in body:
+            raise ClientError(
+                "activation requires 'expected_active_revision'"
+                " (null when publishing the ruleset's first revision)"
+            )
+        expected = body["expected_active_revision"]
+        if expected is not None and not (
+            isinstance(expected, str) and expected
+        ):
+            raise ClientError(
+                "'expected_active_revision' must be a non-empty string or null"
+            )
+        return self.store.activate_ruleset_revision(name, revision, expected)
+
+    def list_revisions(self, name):
+        history = self.store.list_ruleset_revisions(name)
+        if history is None:
+            raise NotFound("ruleset %r not found" % name)
+        return history
+
+    def impact_review(self, name, target_revision, body):
+        """Pre-publication review of a target revision over a batch.
+
+        The envelope (base revision + 1..50 unique assessment ids) is
+        validated here; every stateful precondition (the base revision
+        still being active, the target revision existing, each assessment
+        belonging to the ruleset and recording that active revision) is
+        confirmed by the store in a single read transaction, which either
+        yields the whole batch or raises ConflictError -- never a partial
+        report.
+        """
+        base_revision, ids = validate_review_body(body)
+        target_rules, rows = self.store.review_impact_inputs(
+            name, target_revision, base_revision, ids
+        )
+        return build_impact_report(
+            name, target_revision, base_revision, rows, target_rules
+        )
+
+    # -- assessments ------------------------------------------------------
+
+    def create_assessment(self, body):
+        if not isinstance(body, dict):
+            raise ClientError("request body must be a JSON object")
+        if body.get("rules") is not None:
+            rules = validate_ruleset(body["rules"])
+            ruleset_name = None
+        else:
+            ruleset_name = body.get("ruleset", "default")
+            if not isinstance(ruleset_name, str) or not ruleset_name:
+                raise ClientError("ruleset must be a non-empty string")
+
+        norm = normalize_request(body)
+
+        if ruleset_name is None:
+            # id is a pure function of (normalized request, rules) -> idempotent
+            # and independent of the input ordering of components/dependencies.
+            aid = stable_hash({"request": norm, "rules": rules})[:32]
+            existing = self.store.get_assessment(aid)
+            if existing is not None:
+                return {"id": aid, "created": False, "result": existing["result"]}
+            result = assess_normalized(norm, rules)
+            # Persist the exact normalized rules snapshot alongside the name:
+            # the assessment stays replayable after the same-named ruleset is
+            # overwritten and for originally inline-rule requests.
+            self.store.put_assessment(aid, ruleset_name, rules, norm, result)
+            return {"id": aid, "created": True, "result": result}
+
+        # Named ruleset: read the active revision at transaction start,
+        # evaluate against it and record that revision id, all atomically.
+        out = self.store.create_named_assessment(ruleset_name, norm)
+        return {
+            "id": out["id"],
+            "created": out["created"],
+            "result": out["result"],
+            "ruleset_revision": out["revision"],
+        }
+
+    def get_assessment(self, aid):
+        row = self.store.get_assessment(aid)
+        if row is None:
+            raise NotFound("assessment %r not found" % aid)
+        return row
+
+    # -- confirmation -----------------------------------------------------
+
+    def confirm(self, aid):
+        # Load the shared immutable accounting snapshot first: existence
+        # is 404, and anything that cannot be proven -- normalized
+        # request/result, summary_hash replay, rules snapshot vs. the
+        # recorded revision -- is refused as a whole (409) even when a
+        # confirmation already exists, so a corrupt row can never be
+        # served from the confirmations mirror.  Pre-upgrade rows are
+        # accepted only when their rules can be recovered and replay
+        # reproduces; current active rules are never substituted.
+        snapshot = self.store.load_accounting_snapshot(aid, action="confirm")
+        existing = self.store.get_confirmation(aid)
+        if existing is not None:
+            return existing
+        result = snapshot.result
+        if result.get("status") != "ok":
+            raise ConflictError(
+                "assessment status is %r; no release conclusion available"
+                % result.get("status")
+            )
+        conf = build_confirmation(
+            snapshot.request, result, snapshot.rules, aid, snapshot.ruleset
+        )
+        self.store.put_confirmation(aid, conf)
+        return conf
+
+    def get_confirmation(self, aid):
+        conf = self.store.get_confirmation(aid)
+        if conf is None:
+            raise NotFound("confirmation for assessment %r not found" % aid)
+        return conf
+
+    # -- fulfillment ------------------------------------------------------
+
+    def fulfillment_check(self, aid, body):
+        row = self.store.get_assessment(aid)
+        if row is None:
+            raise NotFound("assessment %r not found" % aid)
+        result = row["result"]
+        if result.get("status") != "ok":
+            # No release conclusion exists for a non-releasable assessment,
+            # so no fulfillment conclusion may be produced either.
+            raise ConflictError(
+                "assessment status is %r; fulfillment checks require status 'ok'"
+                % result.get("status")
+            )
+        if not isinstance(body, dict):
+            raise ClientError("request body must be a JSON object")
+        return check_fulfillment(body, result)
+
+    # -- obligation schedule -----------------------------------------------
+
+    def obligation_schedule(self, aid, body):
+        row = self.store.get_assessment(aid)
+        if row is None:
+            raise NotFound("assessment %r not found" % aid)
+        result = row["result"]
+        if result.get("status") != "ok":
+            # No release conclusion exists for a non-releasable assessment,
+            # so no obligation schedule may be produced either.
+            raise ConflictError(
+                "assessment status is %r; obligation schedules require status 'ok'"
+                % result.get("status")
+            )
+        if not isinstance(body, dict):
+            raise ClientError("request body must be a JSON object")
+        return build_schedule(body, result, aid)
+
+    # -- responsibility plan -----------------------------------------------
+
+    def responsibility_plan(self, aid, body):
+        row = self.store.get_assessment(aid)
+        if row is None:
+            raise NotFound("assessment %r not found" % aid)
+        result = row["result"]
+        if result.get("status") != "ok":
+            # No release conclusion exists for a non-releasable assessment,
+            # so no responsibility plan may be produced either.
+            raise ConflictError(
+                "assessment status is %r; responsibility plans require status 'ok'"
+                % result.get("status")
+            )
+        if not isinstance(body, dict):
+            raise ClientError("request body must be a JSON object")
+        return build_plan(body, result, aid)
+
+    # -- remediation plan ---------------------------------------------------
+
+    def remediation_plan(self, aid, body):
+        # The shared immutable snapshot is the only input to remediation
+        # planning: existence is 404, an unverifiable snapshot is a
+        # wholesale 409, and planning always runs against the pinned
+        # historical rules -- never the currently active ruleset.
+        snapshot = self.store.load_accounting_snapshot(
+            aid, action="plan remediation for"
+        )
+        return plan_remediation(snapshot, body, aid)
+
+    # -- comparison -----------------------------------------------------
+
+    def compare(self, body):
+        if not isinstance(body, dict):
+            raise ClientError("request body must be a JSON object")
+        baseline_id = body.get("baseline_id")
+        target_id = body.get("target_id")
+        if not isinstance(baseline_id, str) or not baseline_id:
+            raise ClientError("baseline_id must be a non-empty string")
+        if not isinstance(target_id, str) or not target_id:
+            raise ClientError("target_id must be a non-empty string")
+        # Both sides come from one shared, immutable accounting snapshot
+        # load -- a single read transaction proves both rows (normalized
+        # request, result/self-hash, replayed summary_hash, rules
+        # snapshot vs. revision), with 404 for missing ids and a
+        # wholesale 409 for any row that cannot be proven.  A comparison
+        # can never pair a historical snapshot with active rules.
+        baseline, target = self.store.load_accounting_snapshots(
+            [baseline_id, target_id], action="compare"
+        )
+        return compare_assessments(baseline, target)
+
+    # -- immutable release batches ----------------------------------------
+
+    def register_release_batch(self, body):
+        batch_id, entries = validate_batch_body(body)
+        manifest, created = self.store.register_release_batch(batch_id, entries)
+        out = dict(manifest)
+        out["created"] = created
+        return out
+
+    def get_release_batch(self, batch_id):
+        manifest = self.store.get_release_batch(batch_id)
+        if manifest is None:
+            raise NotFound("release batch %r not found" % batch_id)
+        return manifest
+
+    def release_batch_snapshot(self, batch_id, body):
+        # Existence is a 404 state check; the snapshot builder then turns
+        # every invalid scheduling/evidence payload into a 422 as a whole,
+        # never a partial result.
+        manifest = self.store.get_release_batch(batch_id)
+        if manifest is None:
+            raise NotFound("release batch %r not found" % batch_id)
+        if not isinstance(body, dict):
+            raise ClientError("request body must be a JSON object")
+        return build_batch_snapshot(body, manifest, batch_id)
+
+    # -- immutable admission attestations ---------------------------------
+
+    def register_admission_attestation(self, path_batch_id, body):
+        (
+            attestation_id,
+            batch_id,
+            expected_hash,
+            snapshot_body,
+        ) = validate_attestation_body(body, path_batch_id)
+        return self.store.register_admission_attestation(
+            attestation_id, batch_id, expected_hash, snapshot_body
+        )
+
+    def get_admission_attestation(self, attestation_id):
+        out = self.store.get_admission_attestation(attestation_id)
+        if out is None:
+            raise NotFound(
+                "admission attestation %r not found" % attestation_id
+            )
+        return out
+
+
+def make_server(host, port, store):
+    api = Api(store)
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "LicenseObligationAPI/1.0"
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *args):
+            sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+        # -- helpers ------------------------------------------------------
+
+        def _json(self, code, obj):
+            body = json.dumps(obj, sort_keys=True).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _body(self):
+            length = self.headers.get("Content-Length")
+            if length is None:
+                raise ClientError("missing Content-Length header")
+            try:
+                size = int(length)
+            except ValueError:
+                raise ClientError("invalid Content-Length header")
+            if size > MAX_BODY_BYTES:
+                raise ClientError("request body too large")
+            raw = self.rfile.read(size)
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                raise ClientError("request body is not valid JSON")
+
+        # -- routing ------------------------------------------------------
+
+        def do_GET(self):
+            self._dispatch("GET")
+
+        def do_POST(self):
+            self._dispatch("POST")
+
+        def do_PUT(self):
+            self._dispatch("PUT")
+
+        def _dispatch(self, method):
+            path = urlparse(self.path).path
+            try:
+                if method == "GET" and path == "/health":
+                    return self._json(200, {"status": "ok"})
+                if method == "GET" and path == "/":
+                    return self._json(
+                        200,
+                        {
+                            "service": "license-obligation-api",
+                            "endpoints": [
+                                "GET  /health",
+                                "GET  /v1/rulesets",
+                                "PUT  /v1/rulesets/{name}",
+                                "GET  /v1/rulesets/{name}",
+                                "POST /v1/rulesets/{name}/revisions",
+                                "GET  /v1/rulesets/{name}/revisions",
+                                "POST /v1/rulesets/{name}/revisions/{revision}/activate",
+                                "POST /v1/rulesets/{name}/revisions/{revision}/impact-review",
+                                "POST /v1/assessments",
+                                "GET  /v1/assessments/{id}",
+                                "POST /v1/assessments/{id}/confirm",
+                                "GET  /v1/assessments/{id}/confirmation",
+                                "POST /v1/assessments/{id}/fulfillment-check",
+                                "POST /v1/assessments/{id}/obligation-schedule",
+                                "POST /v1/assessments/{id}/responsibility-plan",
+                                "POST /v1/assessments/{id}/remediation-plan",
+                                "POST /v1/assessments/compare",
+                                "POST /v1/release-batches",
+                                "GET  /v1/release-batches/{batch_id}",
+                                "POST /v1/release-batches/{batch_id}/fulfillment-snapshot",
+                                "POST /v1/release-batches/{batch_id}/admission-attestation",
+                                "GET  /v1/admission-attestations/{attestation_id}",
+                            ],
+                        },
+                    )
+
+                if method == "POST" and path == "/v1/assessments/compare":
+                    return self._json(200, api.compare(self._body()))
+
+                if method == "POST" and path == "/v1/release-batches":
+                    return self._json(200, api.register_release_batch(self._body()))
+
+                m = _BATCH_RE.match(path)
+                if m and method == "GET" and m.group(1) is not None \
+                        and m.group(2) is None:
+                    return self._json(200, api.get_release_batch(m.group(1)))
+                if m and method == "POST" and m.group(1) is not None \
+                        and m.group(2) == "/fulfillment-snapshot":
+                    return self._json(
+                        200,
+                        api.release_batch_snapshot(m.group(1), self._body()),
+                    )
+                if m and method == "POST" and m.group(1) is not None \
+                        and m.group(2) == "/admission-attestation":
+                    return self._json(
+                        200,
+                        api.register_admission_attestation(
+                            m.group(1), self._body()
+                        ),
+                    )
+
+                m = _ATTEST_RE.match(path)
+                if m and method == "GET" and m.group(1) is not None:
+                    return self._json(
+                        200, api.get_admission_attestation(m.group(1))
+                    )
+
+                m = _REVISION_RE.match(path)
+                if m:
+                    rname, rev, activate = m.group(1), m.group(2), m.group(3)
+                    if method == "POST" and rev is None:
+                        return self._json(200, api.create_revision(rname, self._body()))
+                    if method == "GET" and rev is None:
+                        return self._json(200, api.list_revisions(rname))
+                    if method == "POST" and rev is not None and activate == "/activate":
+                        return self._json(
+                            200, api.activate_revision(rname, rev, self._body())
+                        )
+                    if method == "POST" and rev is not None and activate == "/impact-review":
+                        return self._json(
+                            200, api.impact_review(rname, rev, self._body())
+                        )
+
+                m = _NAME_RE.match(path)
+                if m:
+                    name = m.group(1)
+                    if method == "GET" and name is None:
+                        return self._json(200, api.list_rulesets())
+                    if method == "GET" and name is not None:
+                        return self._json(200, api.get_ruleset(name))
+                    if method == "PUT" and name is not None:
+                        return self._json(200, api.put_ruleset(name, self._body()))
+
+                m = _ASSESS_RE.match(path)
+                if m:
+                    aid, sub = m.group(1), m.group(2)
+                    if method == "POST" and aid is None:
+                        return self._json(200, api.create_assessment(self._body()))
+                    if method == "GET" and aid is not None and sub is None:
+                        return self._json(200, api.get_assessment(aid))
+                    if method == "POST" and aid is not None and sub == "/confirm":
+                        return self._json(200, api.confirm(aid))
+                    if method == "GET" and aid is not None and sub == "/confirmation":
+                        return self._json(200, api.get_confirmation(aid))
+                    if method == "POST" and aid is not None and sub == "/fulfillment-check":
+                        return self._json(200, api.fulfillment_check(aid, self._body()))
+                    if method == "POST" and aid is not None and sub == "/obligation-schedule":
+                        return self._json(200, api.obligation_schedule(aid, self._body()))
+                    if method == "POST" and aid is not None and sub == "/responsibility-plan":
+                        return self._json(200, api.responsibility_plan(aid, self._body()))
+                    if method == "POST" and aid is not None and sub == "/remediation-plan":
+                        return self._json(200, api.remediation_plan(aid, self._body()))
+
+                raise NotFound("no route for %s %s" % (method, path))
+            except UnprocessableError as exc:
+                return self._json(422, {"error": str(exc)})
+            except PartialPlanError as exc:
+                return self._json(409, exc.payload)
+            except RemediationConflict as exc:
+                return self._json(409, exc.payload)
+            except ClientError as exc:
+                return self._json(400, {"error": str(exc)})
+            except NotFound as exc:
+                return self._json(404, {"error": str(exc)})
+            except ConflictError as exc:
+                payload = {"error": str(exc)}
+                if exc.details:
+                    payload.update(exc.details)
+                return self._json(409, payload)
+            except Exception:  # pragma: no cover - defensive
+                traceback.print_exc()
+                return self._json(500, {"error": "internal error"})
+
+    return ThreadingHTTPServer((host, port), Handler)
