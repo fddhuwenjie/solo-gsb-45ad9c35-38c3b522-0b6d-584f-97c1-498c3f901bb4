@@ -429,6 +429,9 @@ def run_checks():
     # -- immutable admission attestations -----------------------------------
     run_admission_attestation_checks()
 
+    # -- continuous validity review of admission proofs ----------------------
+    run_validity_review_checks()
+
     # -- WITH exception removes propagation ----------------------------------
     exc_request = {
         "components": [
@@ -4786,6 +4789,338 @@ def run_admission_attestation_checks():
     )
     code, _ = call("GET", "/v1/admission-attestations/att-concurrent-diff")
     check("attestation: exactly one winner persisted", code == 200)
+
+
+def run_validity_review_checks():
+    """End-to-end checks for the read-only admission-proof validity review.
+
+    Covers: unchanged replay (same conclusion + review hash, independent
+    of object/array order and UTC spellings), valid-changed on an allowed
+    material supplement, pending on an incomplete-but-open submission,
+    expired once time passes a deadline, per-instance diffs, binding
+    conflicts (409) on changed batch hash / release_at / timezone /
+    workdays / holidays / deadline rules / evidence rules, 404 on an
+    unknown proof, 400 envelope errors, 422 on invalid content, and that
+    the stored proof is never rewritten by any review.
+    """
+    path = "/v1/release-batches/vr-rel-1/admission-attestation"
+    review_path = "/v1/admission-attestations/vr-att-1/validity-review"
+    rules = {
+        "licenses": {
+            "A-MIT": {"obligations": ["attribution", "license-text"]},
+            "A-GPL": {
+                "obligations": ["attribution", "license-text", "source-offer"],
+                "propagates": ["static"],
+            },
+            "A-ISC": {"obligations": ["attribution"]},
+        },
+        "obligation_scopes": {"source-offer": ["binary", "source"]},
+    }
+    code, _ = call("PUT", "/v1/rulesets/vrrel", rules)
+    check("validity: ruleset published", code == 200)
+
+    def assess(spec):
+        code, out = call("POST", "/v1/assessments",
+                         dict({"ruleset": "vrrel"}, **spec))
+        check("validity: assessment ok (%s)" % spec["product"], code == 200,
+              json.dumps(out)[:160])
+        return out["id"]
+
+    aid1 = assess({
+        "product": "vr-a", "distribution": "binary",
+        "components": [
+            {"id": "art-a", "name": "Artifact A", "version": "1.0.0",
+             "license": "A-MIT"},
+            {"id": "common", "name": "Common Kit", "version": "2.3.1",
+             "license": "A-GPL", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "art-a", "to": "common"}],
+    })
+    aid2 = assess({
+        "product": "vr-b", "distribution": "binary",
+        "components": [
+            {"id": "art-b", "name": "Artifact B", "version": "0.9.0",
+             "license": "A-ISC"},
+            {"id": "common", "name": "Common Kit", "version": "2.3.1",
+             "license": "A-GPL", "linkage": "static"},
+        ],
+        "dependencies": [{"from": "art-b", "to": "common"}],
+    })
+    code, batch = call("POST", "/v1/release-batches", {
+        "batch_id": "vr-rel-1",
+        "entries": [
+            {"assessment_id": aid1, "id": "art-a", "version": "1.0.0",
+             "dependencies": ["common"]},
+            {"assessment_id": aid2, "id": "art-b", "version": "0.9.0",
+             "dependencies": ["common"]},
+        ],
+    })
+    check("validity: batch registered", code == 200 and batch.get("created"),
+          json.dumps(batch)[:200])
+    batch_hash = batch["batch_hash"]
+
+    def full_body(now="2026-10-01T12:00:00+08:00", materials=None):
+        mats = [
+            {"id": "product-notice", "digest": "sha256:aaa",
+             "type": "notice", "scope": "product",
+             "provided_at": "2026-09-26T10:00:00+08:00"},
+            {"id": "common-copy", "digest": "sha256:bbb",
+             "type": "license-copy", "scope": "component",
+             "component": "common",
+             "provided_at": "2026-09-27T10:00:00+08:00"},
+            {"id": "arta-copy", "digest": "sha256:ccc",
+             "type": "license-copy", "scope": "component",
+             "component": "art-a",
+             "provided_at": "2026-09-27T10:00:00+08:00"},
+            {"id": "common-source", "digest": "sha256:ddd",
+             "type": "source-archive", "scope": "component",
+             "component": "common",
+             "provided_at": "2026-09-30T10:00:00+08:00"},
+        ] if materials is None else materials
+        return {
+            "attestation_id": "vr-att-1",
+            "batch_id": "vr-rel-1",
+            "batch_hash": batch_hash,
+            "now": now,
+            "release_at": "2026-09-25T16:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+            "workdays": [1, 2, 3, 4, 5],
+            "holidays": ["2026-10-01", "2026-10-02"],
+            "obligations": {
+                "attribution": {"offset": 30, "unit": "calendar_day",
+                                "depends_on": []},
+                "license-text": {"offset": 20, "unit": "calendar_day",
+                                 "depends_on": []},
+                "source-offer": {"offset": 5, "unit": "business_day",
+                                 "depends_on": ["license-text"]},
+            },
+            "materials": mats,
+            "rules": {"obligations": {
+                "attribution": {"type": "notice"},
+                "license-text": {"all": [
+                    {"type": "notice"},
+                    {"any": [{"type": "license-copy"},
+                             {"type": "license-bundle"}]},
+                ]},
+                "source-offer": {"all": [
+                    {"type": "source-archive"}, {"scope": "component"},
+                ]},
+            }},
+        }
+
+    code, att = call("POST", path, full_body())
+    check("validity: proof minted (all 6 satisfied)",
+          code == 200 and att.get("created") is True
+          and att["snapshot"]["summary"] == {
+              "total": 6, "satisfied": 6, "overdue": 0, "pending": 0},
+          json.dumps(att)[:200])
+    att_hash = att["attestation_hash"]
+    orig_snap_hash = att["snapshot_hash"]
+
+    def review(**overrides):
+        b = full_body()
+        for k, v in overrides.items():
+            b[k] = v
+        return call("POST", review_path, b)
+
+    # -- unchanged: exact replay -------------------------------------------
+    code, rv = review()
+    check("validity: unchanged replay -> 200 unchanged",
+          code == 200 and rv.get("conclusion") == "unchanged"
+          and rv.get("snapshot_hash") == orig_snap_hash
+          and len(rv.get("review_hash", "")) == 64
+          and rv.get("attestation_hash") == att_hash
+          and rv.get("diff_instances") == []
+          and rv.get("changed_inputs", {}).get("now_changed") is False
+          and rv.get("summary") == {
+              "total": 6, "satisfied": 6, "overdue": 0, "pending": 0},
+          json.dumps(rv)[:240])
+    unchanged_hash = rv["review_hash"]
+
+    # order + UTC-spelling independence -> identical review_hash
+    eq = full_body()
+    eq["now"] = "2026-10-01T04:00:00Z"
+    eq["release_at"] = "2026-09-25T08:00:00Z"
+    eq["materials"] = list(reversed(eq["materials"]))
+    eq["workdays"] = [5, 4, 3, 2, 1]
+    eq["holidays"] = ["2026-10-02", "2026-10-01"]
+    eq["obligations"] = {
+        "source-offer": {"depends_on": ["license-text"], "unit": "business_day",
+                         "offset": 5},
+        "attribution": {"depends_on": [], "unit": "calendar_day", "offset": 30},
+        "license-text": {"depends_on": [], "unit": "calendar_day", "offset": 20},
+    }
+    code, rv_eq = call("POST", review_path, eq)
+    check("validity: order/UTC-spelling independence keeps unchanged + hash",
+          code == 200 and rv_eq.get("conclusion") == "unchanged"
+          and rv_eq.get("review_hash") == unchanged_hash
+          and rv_eq.get("snapshot_hash") == orig_snap_hash,
+          json.dumps(rv_eq)[:200])
+
+    # -- valid-changed: time moved (same day stays satisfied) --------------
+    code, rv = review(now="2026-10-03T12:00:00+08:00")
+    check("validity: later now, still all satisfied -> valid-changed",
+          code == 200 and rv.get("conclusion") == "valid-changed"
+          and rv.get("snapshot_hash") != orig_snap_hash
+          and rv.get("changed_inputs", {}).get("now_changed") is True
+          and rv.get("summary", {}).get("satisfied") == 6
+          and rv.get("diff_instances") == [],
+          json.dumps(rv)[:240])
+
+    # -- valid-changed: an allowed material supplement changes witnesses ---
+    extra = full_body()["materials"] + [{
+        "id": "extra-notice", "digest": "sha256:eee",
+        "type": "notice", "scope": "product",
+        "provided_at": "2026-09-28T10:00:00+08:00"}]
+    code, rv = review(materials=extra)
+    check("validity: material supplement -> valid-changed with material diff",
+          code == 200 and rv.get("conclusion") == "valid-changed"
+          and rv.get("changed_inputs", {}).get("materials_added")
+          == ["extra-notice"],
+          json.dumps(rv)[:240])
+
+    # -- pending: missing common-source while the 10-06 deadline is open ---
+    incomplete = [m for m in full_body()["materials"]
+                  if m["id"] != "common-source"]
+    code, rv = review(now="2026-10-01T12:00:00+08:00", materials=incomplete)
+    diffs = {(d["component"], d["obligation"]):
+             (d["before_status"], d["after_status"])
+             for d in rv.get("diff_instances", [])}
+    check("validity: open gap -> pending with before/after diff",
+          code == 200 and rv.get("conclusion") == "pending"
+          and rv.get("summary", {}).get("pending") == 1
+          and rv.get("summary", {}).get("overdue") == 0
+          and diffs.get(("common", "source-offer")) == ("satisfied", "pending")
+          and set(rv["diff_instances"][0]["before_satisfied_by"])
+          == {"common-source", "common-copy"}
+          and rv["diff_instances"][0]["after_satisfied_by"] == []
+          and rv["diff_instances"][0]["gaps"][0]["reason"]
+          == "incomplete-evidence",
+          json.dumps(rv)[:240])
+
+    # -- expired: after the 10-06 deadline, the same gap is overdue --------
+    code, rv = review(now="2026-10-10T12:00:00+08:00", materials=incomplete)
+    check("validity: deadline passed -> expired",
+          code == 200 and rv.get("conclusion") == "expired"
+          and rv.get("summary", {}).get("overdue") >= 1
+          and any(d["after_status"] == "overdue"
+                  for d in rv.get("diff_instances", [])),
+          json.dumps(rv.get("summary")))
+
+    # no materials at all after the deadlines -> everything expired
+    code, rv = review(now="2026-11-01T12:00:00+08:00", materials=[])
+    check("validity: fully overdue batch -> expired, 0 satisfied",
+          code == 200 and rv.get("conclusion") == "expired"
+          and rv.get("summary", {}).get("satisfied") == 0
+          and rv.get("summary", {}).get("overdue") == 6
+          and len(rv.get("diff_instances")) == 6,
+          json.dumps(rv.get("summary")))
+
+    # -- binding conflicts (409): only now/materials may move --------------
+    conflict_cases = [
+        ("batch_hash", {"batch_hash": "f" * 64}, "batch-hash-mismatch"),
+        ("batch_id", {"batch_id": "vr-rel-2"}, "attestation-batch-mismatch"),
+        ("release_at", {"release_at": "2026-09-26T16:00:00+08:00"},
+         "admission-binding-changed"),
+        ("timezone", {"timezone": "Europe/Berlin"},
+         "admission-binding-changed"),
+        ("workdays", {"workdays": [1, 2, 3, 4, 5, 6]},
+         "admission-binding-changed"),
+        ("holidays", {"holidays": ["2026-10-01"]},
+         "admission-binding-changed"),
+        ("deadline offset",
+         {"obligations": dict(full_body()["obligations"],
+                              **{"attribution":
+                                 {"offset": 31, "unit": "calendar_day",
+                                  "depends_on": []}})},
+         "admission-binding-changed"),
+        ("deadline unit",
+         {"obligations": dict(full_body()["obligations"],
+                              **{"attribution":
+                                 {"offset": 30, "unit": "business_day",
+                                  "depends_on": []}})},
+         "admission-binding-changed"),
+        ("depends_on",
+         {"obligations": dict(full_body()["obligations"],
+                              **{"source-offer":
+                                 {"offset": 5, "unit": "business_day",
+                                  "depends_on": []}})},
+         "admission-binding-changed"),
+        ("evidence rules",
+         {"rules": {"obligations":
+                    dict(full_body()["rules"]["obligations"],
+                         **{"attribution": {"type": "source-archive"}})}},
+         "admission-binding-changed"),
+        ("evidence rules dropped", {"rules": {"obligations": {}}},
+         "admission-binding-changed"),
+    ]
+    for label, changes, reason in conflict_cases:
+        code, bo = review(**changes)
+        check("validity: %s -> 409 %s" % (label, reason),
+              code == 409 and bo.get("reason") == reason
+              and bo.get("attestation_id") == "vr-att-1",
+              "%s -> %s %s" % (label, code, json.dumps(bo)[:160]))
+
+    # the deadline-rule conflict pinpoints the changed field
+    code, bo = review(holidays=["2026-10-01"])
+    check("validity: structural conflict reports changed_fields",
+          code == 409 and bo.get("changed_fields") == ["holidays"],
+          json.dumps(bo)[:200])
+
+    # -- unknown proof -> 404 -----------------------------------------------
+    code, _ = call(
+        "POST", "/v1/admission-attestations/ghost-proof/validity-review",
+        full_body())
+    check("validity: unknown attestation -> 404", code == 404)
+
+    # -- envelope errors -> 400 ---------------------------------------------
+    bad_envelopes = [
+        ["not-an-object"],
+        {k: v for k, v in full_body().items() if k != "batch_id"},
+        {"batch_id": "", "batch_hash": batch_hash},
+        {"batch_id": "vr-rel-1", "batch_hash": "deadbeef"},
+        {"batch_id": "bad id!", "batch_hash": batch_hash},
+        {k: v for k, v in full_body().items() if k != "now"},
+        {k: v for k, v in full_body().items() if k != "obligations"},
+        {k: v for k, v in full_body().items() if k != "holidays"},
+    ]
+    for i, bad in enumerate(bad_envelopes):
+        code, bo = call("POST", review_path, bad)
+        check("validity: envelope error %d -> 400" % i, code == 400
+              and "conclusion" not in bo, json.dumps(bo)[:120])
+
+    # -- invalid content -> 422 ---------------------------------------------
+    bad_content = [
+        ("bad now", {"now": "not-a-time"}),
+        ("unknown material component",
+         {"materials": full_body()["materials"] + [
+             {"id": "x", "type": "notice", "scope": "component",
+              "component": "ghost", "provided_at": "2026-09-26T10:00:00Z"}]}),
+    ]
+    for label, changes in bad_content:
+        code, bo = review(**changes)
+        check("validity: %s -> 422" % label, code == 422
+              and "conclusion" not in bo,
+              "%s -> %s %s" % (label, code, json.dumps(bo)[:120]))
+
+    # malformed provided_at -> 422
+    mats_bad = [dict(full_body()["materials"][0], provided_at="yesterday")] \
+        + full_body()["materials"][1:]
+    code, bo = review(materials=mats_bad)
+    check("validity: malformed provided_at -> 422", code == 422,
+          "%s %s" % (code, json.dumps(bo)[:120]))
+
+    # -- the stored proof is never rewritten by any review ------------------
+    code, frozen = call("GET", "/v1/admission-attestations/vr-att-1")
+    check("validity: proof unchanged after reviews (incl. conflicts)",
+          code == 200 and frozen["attestation_hash"] == att_hash
+          and frozen["snapshot_hash"] == orig_snap_hash
+          and frozen["snapshot"]["summary"]["satisfied"] == 6
+          and frozen["snapshot"]["now"] == "2026-10-01T04:00:00Z",
+          json.dumps(frozen.get("snapshot", {}).get("now")))
+    code, still_batch = call("GET", "/v1/release-batches/vr-rel-1")
+    check("validity: batch still bound to the same hash",
+          code == 200 and still_batch["batch_hash"] == batch_hash)
 
 
 def run_accounting_snapshot_checks():

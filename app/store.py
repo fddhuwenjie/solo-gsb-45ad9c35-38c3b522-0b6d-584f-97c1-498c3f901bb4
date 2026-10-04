@@ -1378,3 +1378,53 @@ class Store:
         out = json.loads(row["body"])
         out.pop("created", None)
         return out
+
+    # -- read-only admission-proof validity reviews -----------------------
+
+    def load_attestation_review_inputs(self, attestation_id):
+        """Load an immutable proof and its frozen batch in one read txn.
+
+        A single deferred read transaction (never upgraded to a write)
+        gives one consistent, read-only view of the stored attestation
+        row -- including its content-addressing ``request_hash`` -- and
+        the frozen batch manifest it binds to.  A missing attestation
+        raises NotFound; a row whose bound batch disappeared raises
+        ConflictError (the foreign key should make that impossible).
+
+        Returns ``(attestation_body, request_hash, manifest)``.  The
+        transaction is rolled back (never written) once both immutable
+        rows are loaded; the subsequent snapshot recomputation is pure
+        over those frozen rows, matching the other read-only snapshot
+        loaders.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            row = conn.execute(
+                "SELECT batch_id, body, request_hash FROM"
+                " release_batch_attestations WHERE attestation_id = ?",
+                (attestation_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFound(
+                    "admission attestation %r not found" % attestation_id
+                )
+            manifest_row = conn.execute(
+                "SELECT manifest FROM release_batches WHERE batch_id = ?",
+                (row["batch_id"],),
+            ).fetchone()
+            if manifest_row is None:
+                raise ConflictError(
+                    "the frozen batch %r bound by attestation %r can no"
+                    " longer be loaded" % (row["batch_id"], attestation_id),
+                    {"reason": "batch-not-found",
+                     "batch_id": row["batch_id"]},
+                )
+            return (
+                json.loads(row["body"]),
+                row["request_hash"],
+                json.loads(manifest_row["manifest"]),
+            )
+        finally:
+            conn.rollback()
+            conn.close()

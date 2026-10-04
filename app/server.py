@@ -24,6 +24,7 @@ Endpoints:
     POST /v1/release-batches/{batch_id}/fulfillment-snapshot
     POST /v1/release-batches/{batch_id}/admission-attestation
     GET  /v1/admission-attestations/{attestation_id}
+    POST /v1/admission-attestations/{attestation_id}/validity-review
 """
 
 import json
@@ -46,6 +47,7 @@ from .rules import validate_ruleset
 from .schedule import build_schedule
 from .snapshot import build_batch_snapshot
 from .solver import assess_normalized, build_confirmation, normalize_request
+from .validity import build_validity_review, validate_review_body as validate_validity_review_body
 
 MAX_BODY_BYTES = 16 * 1024 * 1024
 _NAME_RE = re.compile(r"^/v1/rulesets(?:/([A-Za-z0-9._-]{1,64}))?$")
@@ -63,7 +65,8 @@ _BATCH_RE = re.compile(
     r"(/(?:fulfillment-snapshot|admission-attestation))?)?$"
 )
 _ATTEST_RE = re.compile(
-    r"^/v1/admission-attestations(?:/([A-Za-z0-9._-]{1,128}))?$"
+    r"^/v1/admission-attestations(?:/([A-Za-z0-9._-]{1,128})"
+    r"(/(?:validity-review))?)?$"
 )
 
 
@@ -374,6 +377,19 @@ class Api:
             )
         return out
 
+    def review_admission_attestation(self, attestation_id, body):
+        # The proof and its frozen batch are loaded together in one
+        # read-only transaction (unknown proof -> 404); the review then
+        # recomputes the snapshot from the submitted now/materials and
+        # returns a stable conclusion.  It is strictly read-only: the
+        # stored attestation is never rewritten, whatever the result.
+        _batch_id, _expected_hash, body = validate_validity_review_body(body)
+        attestation, request_hash, manifest = \
+            self.store.load_attestation_review_inputs(attestation_id)
+        return build_validity_review(
+            body, attestation, manifest, attestation_id, request_hash
+        )
+
 
 def make_server(host, port, store):
     api = Api(store)
@@ -455,6 +471,7 @@ def make_server(host, port, store):
                                 "POST /v1/release-batches/{batch_id}/fulfillment-snapshot",
                                 "POST /v1/release-batches/{batch_id}/admission-attestation",
                                 "GET  /v1/admission-attestations/{attestation_id}",
+                                "POST /v1/admission-attestations/{attestation_id}/validity-review",
                             ],
                         },
                     )
@@ -485,9 +502,18 @@ def make_server(host, port, store):
                     )
 
                 m = _ATTEST_RE.match(path)
-                if m and method == "GET" and m.group(1) is not None:
+                if m and method == "GET" and m.group(1) is not None \
+                        and m.group(2) is None:
                     return self._json(
                         200, api.get_admission_attestation(m.group(1))
+                    )
+                if m and method == "POST" and m.group(1) is not None \
+                        and m.group(2) == "/validity-review":
+                    return self._json(
+                        200,
+                        api.review_admission_attestation(
+                            m.group(1), self._body()
+                        ),
                     )
 
                 m = _REVISION_RE.match(path)

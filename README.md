@@ -60,6 +60,7 @@ python3 tests/selftest.py
 | POST | `/v1/release-batches/{batch_id}/fulfillment-snapshot` | 批次履约状态快照（截止日 + 证据判定） |
 | POST | `/v1/release-batches/{batch_id}/admission-attestation` | 登记不可变准入证明（全部义务 `satisfied` 才放行，幂等） |
 | GET | `/v1/admission-attestations/{attestation_id}` | 读取已登记准入证明 |
+| POST | `/v1/admission-attestations/{attestation_id}/validity-review` | 已登记准入证明的持续有效性复核（只读，不改写原证明） |
 
 ### 不可变修订与原子发布（含并发发布与回滚）
 
@@ -710,6 +711,93 @@ curl -sS "$BASE/v1/admission-attestations/att-2026-10-01-001"
 id；旧 PUT/GET、既有评估快照与确认版语义全部保持不变。发布批次与准入
 证明使用的新表在同一迁移中以 `CREATE TABLE IF NOT EXISTS` 建立
 （`user_version` 升至 4），旧库可直接打开。
+
+### 准入证明持续有效性复核 `POST /v1/admission-attestations/{attestation_id}/validity-review`
+
+已登记的发布批次可能在**时间推进或材料补交后**不再满足原准入条件（例如
+原本尚未到期的义务在新时刻变为逾期，或补交材料补全了证据）。本接口对一份
+**已登记、不可变**的准入证明做持续有效性复核：**绝不改写原证明**，只在
+同一个 SQLite **只读事务**（`BEGIN` 延迟读事务，结尾回滚、从不升级为写）
+中加载不可变证明与其冻结批次，随后基于提交的新输入重算快照。
+
+调用方在请求体中提交证明绑定的 `batch_id`、`batch_hash`，以及生成履约
+快照所需的输入：**新的当前时刻 `now`**、`release_at`、`timezone`、
+工作日/节假日、每项义务的 `{offset, unit, depends_on}` 截止规则、当前
+持有的**材料/证据**（排期与证据语义与
+[批次履约状态快照](#批次履约状态快照-post-v1release-batchesbatch_idfulfillment-snapshot)
+完全一致）。
+
+服务端依次执行：
+
+1. 在同一只读事务中加载证明与其绑定批次；证明不存在 → **404**；
+2. 核对绑定：请求 `batch_id` 必须是证明绑定的批次、请求 `batch_hash`
+   必须同时等于冻结清单哈希与证明背书的哈希，`release_at`、`timezone`、
+   工作日、节假日、截止规则结构（`offset`/`unit`/`depends_on`）与嵌套
+   `all`/`any` 证据规则必须与铸证明时逐字一致（以规范化输入哈希为准，
+   顺序/UTC 写法无关）；任一不一致 → **409**：
+   - `reason: "attestation-batch-mismatch"`（提交了别的 `batch_id`）；
+   - `reason: "batch-hash-mismatch"`（附 `expected_batch_hash` 与
+     `registered_batch_hash`）；
+   - `reason: "admission-binding-changed"`（规则结构等不可变输入发生
+     变化，附排序后的 `changed_fields`：`release_at`/`timezone`/
+     `workdays`/`holidays`/`obligations`/`rules`）；
+3. 快照重算本身的内容校验（未知时区、非法时刻、缺义务规则、悬空依赖/
+   成环、非法材料/证据规则等）→ 整体 **422**，不产生部分结论；
+4. 仅 **`now` 与材料**允许相对原证明变化，据此给出四选一的稳定结论：
+
+| 结论 | 含义 |
+| --- | --- |
+| `unchanged` | 所有实例仍 `satisfied`，且重算快照与证明内嵌快照逐字节相同（即同 `now`、同材料的纯粹重放） |
+| `valid-changed` | 所有实例仍 `satisfied`，但快照发生了允许的变化（时间推进、材料补交/替换等） |
+| `pending` | 存在尚未 `satisfied` 的实例，但没有任何实例逾期（截止日仍开放，等待证据） |
+| `expired` | 至少一个实例已 `overdue`——原准入不再成立（逾期优先于其它状态） |
+
+响应包含稳定结论、原/新快照哈希、`summary`、逐实例差异 `diff_instances`
+（仅列出 `status` 或见证材料集合发生变化的实例，附
+`before_status`/`after_status`/`deadline`/`before_satisfied_by`/
+`after_satisfied_by`，未满足时附 `gaps`）、允许通道变化摘要
+`changed_inputs`（`now_changed`、`materials_added`/`materials_removed`/
+`materials_changed`）、新的完整 `snapshot`，以及覆盖规范化结论的
+`review_hash`（64 位 SHA-256）。所有集合均排序输出，**请求对象/数组
+键序不影响结论、差异与复核哈希**。该接口是纯只读的：无论结论如何，
+已登记证明、其内嵌快照与批次清单都保持原样。
+
+```bash
+BASE=http://localhost:8080
+
+# 对已登记证明做复核：时间推进到 2026-10-20，材料不变（截止日 10-25 仍开放）
+curl -sS -X POST \
+  "$BASE/v1/admission-attestations/att-2026-10-01-001/validity-review" \
+  -H 'Content-Type: application/json' -d @- <<JSON
+{
+  "batch_id": "release-2026-10-01",
+  "batch_hash": "$BH",
+  "now": "2026-10-20T12:00:00+08:00",
+  "release_at": "2026-09-25T16:00:00+08:00",
+  "timezone": "Asia/Shanghai",
+  "workdays": [1, 2, 3, 4, 5],
+  "holidays": ["2026-10-01", "2026-10-02"],
+  "obligations": {
+    "attribution":  {"offset": 30, "unit": "calendar_day", "depends_on": []},
+    "license-text": {"offset": 20, "unit": "calendar_day", "depends_on": []},
+    "source-offer": {"offset": 5,  "unit": "business_day",
+                     "depends_on": ["license-text"]}
+  },
+  "materials": [ /* 与铸证明时相同的材料集（也可补交新材料） */ ],
+  "rules": {"obligations": { /* 必须与铸证明时完全一致的证据规则 */ }}
+}
+JSON
+# 200 {"attestation_id": "att-2026-10-01-001", "conclusion": "valid-changed",
+#      "original_snapshot_hash": "…", "snapshot_hash": "…",
+#      "review_hash": "…（64 位 SHA-256）", "summary": {…},
+#      "diff_instances": [], "changed_inputs": {"now_changed": true, …},
+#      "snapshot": { ……重算后的完整快照…… }}
+
+# 纯粹重放（同 now、同材料）-> "unchanged"，snapshot_hash 与原证明一致
+# 时间越过某截止日且证据未满足 -> "expired"，diff_instances 列出逾期实例
+# 未知证明 -> 404；batch_id/batch_hash/规则结构冲突 -> 409
+# 坏时区/坏时刻/缺截止规则/坏证据规则 -> 422；信封字段缺失/非法 -> 400
+```
 
 ### 提交核算 `POST /v1/assessments`
 
@@ -1505,7 +1593,8 @@ app/review.py         发布前影响审查：批次信封校验、用目标修�
 app/batches.py        不可变发布批次：批次信封校验（batch_id + 1～50 条目）、同事务快照核验与共享组件/制品去重合并（名称/版本/许可证一致校验、义务并集、rule_revisions、batch_hash）
 app/snapshot.py       批次履约状态快照：期限内材料按 all/any 证据规则判定去重后组件义务（satisfied/overdue/pending）、时区日期期限窗口、depends_on 最终截止日、缺口/命中材料与逾期汇总（snapshot_hash）；同时导出规范化快照输入供准入证明做内容寻址
 app/attestation.py    不可变准入证明：信封校验（attestation_id/batch_id/期望 batch_hash + 快照输入）、同事务核对冻结批次哈希并重算快照、全部实例 satisfied 才放行（否则 409 且不留记录）、证明内容哈希与内容一致幂等
-app/store.py          SQLite 持久化（WAL，写锁）、规则快照绑定与旧库核验式迁移、不可变修订/CAS 激活/激活审计的事务实现、共享核算快照的单读事务加载与影响审查前置条件核验、发布批次与准入证明的单写事务登记（锁定核算与规则修订、全成或全败、幂等）
+app/validity.py       准入证明持续有效性复核：信封校验、同一只读事务加载不可变证明与冻结批次并核对 batch_id/batch_hash/规则结构（仅允许 now 与材料变化）、重算快照给出 unchanged/valid-changed/pending/expired 稳定结论、逐实例差异与 review_hash（纯只读，不改写原证明）
+app/store.py          SQLite 持久化（WAL，写锁）、规则快照绑定与旧库核验式迁移、不可变修订/CAS 激活/激活审计的事务实现、共享核算快照的单读事务加载与影响审查前置条件核验、发布批次与准入证明的单写事务登记（锁定核算与规则修订、全成或全败、幂等）、准入证明有效性复核的证明+批次单读事务只读加载
 app/solver.py         义务传播、OR 分支选择（穷举 + 分支定界）、冲突检测、确认版生成
 app/fulfillment.py    履约材料核算：义务实例展开、all/any 证据规则（叶子命中按材料集合累积，可由多份材料共同满足）、全局最小集合选择（穷举 + 分支定界）
 app/schedule.py       义务截止日排期：RFC 3339/IANA 时区解析、日历日/工作日偏移、沿无环依赖反向收紧与收紧链还原
@@ -1514,7 +1603,7 @@ app/remediation.py   许可证整改：候选表达式/成本校验（非法整�
 app/compare.py        核算对比：原子差异分解（稳定编号）、反事实回滚与全局最小归因集（按大小递增、ID 字典序完备枚举，非法中间状态不计命中）
 app/accounting.py    共享的不可变核算快照：只读事务内核验规范化 request、id 绑定、结果体/summary_hash 自洽与重放复现、规则快照与修订内容哈希一致（确认/对比/整改/影响审查四个入口共用）
 app/server.py         ThreadingHTTPServer JSON 路由
-tests/selftest.py     端到端自检（含草稿/首版发布门禁、并发发布与回滚、发布前影响审查、不可变发布批次登记/幂等/合并冲突/快照不可变、批次履约状态快照：期限窗口/逾期判定/共享组件一次计数/顺序无关哈希、不可变准入证明：全部 satisfied 才登记/同内容幂等/异内容冲突/拒绝不留记录/规则发布后证明不可变；以及确认/对比/整改/影响审查共享不可变核算快照的逐列篡改拒绝、旧库记录仅在可还原并复现 summary_hash 时接受的回归用例）
+tests/selftest.py     端到端自检（含草稿/首版发布门禁、并发发布与回滚、发布前影响审查、不可变发布批次登记/幂等/合并冲突/快照不可变、批次履约状态快照：期限窗口/逾期判定/共享组件一次计数/顺序无关哈希、不可变准入证明：全部 satisfied 才登记/同内容幂等/异内容冲突/拒绝不留记录/规则发布后证明不可变；准入证明持续有效性复核：只读事务核对绑定与规则结构、仅时间/材料可变、unchanged/valid-changed/pending/expired 稳定结论与差异/review_hash、顺序无关、原证明不被改写；以及确认/对比/整改/影响审查共享不可变核算快照的逐列篡改拒绝、旧库记录仅在可还原并复现 summary_hash 时接受的回归用例）
 Dockerfile / docker-compose.yml / .dockerignore
 ```
 
